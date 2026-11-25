@@ -2,6 +2,8 @@ Random Pixel Image & H.264 Video Generator — Windows Build
 
 Features
 --------
+- About menu is positioned at the far-right side of the application menu bar and displays: Pixel Generator V1.1
+- The About window includes a clickable GitHub project link that opens https://github.com/KastriotH/pixel-generator in the default web browser
 - Default image size: 1920 × 1080
 - Default color depth: 1 bit (pure black and pure white)
 - Color depth selector: 1–24 bits; choosing a depth automatically generates a new image at that depth
