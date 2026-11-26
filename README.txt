@@ -1,4 +1,4 @@
-Random Pixel Image, GIF & H.264 Video Generator — Windows Build
+Random Pixel Image, Fractal, GIF & H.264 Video Generator — Windows Build
 
 Features
 --------
@@ -24,10 +24,18 @@ Features
 - Image preview and PNG export use the selected resolution
 - The resolution dropdown and a wide 750-pixel pixel-doubling slider share the top control row
 - Generate Random Image, Generate Random Fractal, Save PNG, Export H.264 Video and Export GIF controls appear first on the lower control row, followed by the color-depth selector and the Bilinear filtering switch
-- Generate Random Fractal button creates a fresh Mandelbrot composition on every click
-- Each fractal generation randomizes the view center, zoom level and color-cycle mapping; some generations show a full-set overview while others explore detailed boundary regions
+- Generate Random Fractal button uses an adjacent Fractal type dropdown with seven families: Mandelbrot, Julia Set, Burning Ship, Tricorn (Mandelbar), Multibrot (Power 3), Celtic Mandelbrot and Phoenix; Mandelbrot remains the default
+- Each fractal generation randomizes the view center, zoom level and color-cycle mapping; Julia and Phoenix also randomize their defining complex parameters; some generations show broader overviews while others explore detailed regions
 - Fractals honor the selected 1–24-bit color depth and use the current pixel-block and bilinear preview settings
-- Changing color depth while viewing a fractal generates a new randomized Mandelbrot view at the new depth
+- Changing the fractal type while viewing a fractal regenerates immediately; changing color depth or resolution preserves and re-renders the current fractal viewport
+- Interactive fractal exploration: scroll the mouse wheel over the preview to zoom toward the pointer, click-drag to pan, and use Reset View to return to the randomized starting viewport; the preview shifts during dragging and re-renders on release
+- Interactive navigation preserves Julia/Phoenix parameters and the current palette; it uses the selected Automatic, CPU or OpenCL GPU renderer and works with all seven fractal families
+- Fractal renderer offers three modes: Automatic (benchmarks CPU vs OpenCL GPU), CPU (Numba multi-threaded), and GPU (OpenCL); the selected mode is remembered between launches
+- Automatic mode benchmarks the selected fractal family at a representative resolution, caches the CPU/GPU decision by device/driver, CPU configuration, fractal family and selected output resolution, and prefers CPU when results are within 3%
+- GPU mode uses PyOpenCL and the NVIDIA OpenCL driver; Automatic mode falls back to Numba CPU if no compatible OpenCL GPU is found or GPU initialization fails
+- OpenCL GPU kernels use double precision for the fractal escape-time iteration; GPU computation is row-chunked to bound temporary memory and the existing color/palette pipeline is shared with CPU output
+- Fractal families use escape-time equations: Mandelbrot (z²+c), Julia Set (z²+c with a randomized complex constant), Burning Ship (absolute real/imaginary components before squaring), Tricorn/Mandelbar (conjugate iteration), cubic Multibrot (z³+c), Celtic Mandelbrot (absolute real component of z²) and Phoenix (quadratic recurrence with a prior-iteration term)
+- All fractal families support the same six color depths, pixel-doubling preview and bilinear filtering controls, and PNG export
 - Fast NumPy-based random pixel generation
 - Pixel doubling slider: square pixel blocks from 1×1 to 32×32 for still images and video
 - Moving the pixel doubling slider updates the image preview immediately; no regeneration button is needed
@@ -68,7 +76,7 @@ Windows executable build
 4. EXE will be created at:
    dist\RandomPixelGenerator.exe
 
-The build installs NumPy, Pillow, imageio-ffmpeg, ttkbootstrap 2.2.7 and PyInstaller. ttkbootstrap supplies the 30 built-in themes; Pillow provides GIF encoding, so no additional GIF library is required. GIF palette generation uses a small sample sheet and regenerates frames from per-frame seeds to keep memory use controlled for longer exports.
+The build installs NumPy, Numba, llvmlite, PyOpenCL, Pillow, imageio-ffmpeg, ttkbootstrap 2.2.7 and PyInstaller. ttkbootstrap supplies the 30 built-in themes; PyOpenCL supplies the OpenCL Python bindings; Pillow provides GIF encoding, so no additional GIF library is required. GIF palette generation uses a small sample sheet and regenerates frames from per-frame seeds to keep memory use controlled for longer exports.
 Window position settings are stored separately in the user profile (under %APPDATA%\RandomPixelGenerator on Windows); they do not need to be packaged with the EXE. The selected theme is saved separately in theme_preference.json in the same folder.
 This package was prepared in a non-Windows environment. A native Windows
 EXE has not been compiled or tested here.
@@ -93,3 +101,40 @@ Style(master=...). ttkbootstrap 2.2.7 binds its process-wide Style singleton to
 the existing Tk root window; passing master= is unsupported and causes startup
 to fail. The GUI smoke test uses a strict Style stub to catch that regression.
 
+
+
+GPU acceleration requirements
+-----------------------------
+- Install a current NVIDIA GeForce driver for the RTX 3070 Ti. The Windows driver provides the vendor OpenCL implementation; PyOpenCL alone is not an OpenCL device driver.
+- PyOpenCL's Windows wheel uses the Khronos OpenCL ICD Loader. The NVIDIA driver registers the actual NVIDIA OpenCL device with Windows.
+- In the application, choose Automatic to benchmark the selected fractal on CPU and GPU, CPU to force the Numba renderer, or GPU to force OpenCL. The selected mode is remembered between launches.
+- Automatic mode caches a decision for each fractal family and exact selected image resolution, tied to the CPU, Numba version, GPU device, driver and PyOpenCL version.
+- If no OpenCL GPU is available, Automatic mode uses the Numba CPU renderer. Explicit GPU mode displays a diagnostic instead of silently changing modes.
+- GPU device compilation is performed by the installed driver on first use. The first GPU render may take extra time while its OpenCL program is compiled; subsequent renders reuse the program.
+- GPU rendering uses FP64 to closely match the existing CPU fractal calculations. Small floating-point differences between CPU and GPU implementations can occur at a few escape-boundary pixels.
+- To run a CPU/GPU comparison on the PC, run: `py -3 benchmark_cpu_gpu.py`. This script benchmarks all seven fractal families at 1920×1080 and 3840×2160 and writes CSV/JSON results.
+- To check CPU/GPU image agreement on a PC with an OpenCL GPU, run: `py -3 test_opencl_fractal_backend.py`. The GPU-specific portion is skipped when no compatible OpenCL GPU is present.
+
+
+OpenCL GPU validation
+---------------------
+1. Update/install the NVIDIA GeForce driver for the RTX 3070 Ti. PyOpenCL is a Python binding; the actual OpenCL implementation is supplied by the NVIDIA driver.
+2. Rebuild the EXE with build_windows.bat. The build collects PyOpenCL's native extension, required DLLs, package data and metadata without recursively collecting unrelated test modules.
+3. Run `py -3 diagnose_opencl.py` from the extracted source folder to list OpenCL platforms/devices and check FP64 support. The RTX 3070 Ti must appear as an OpenCL GPU with double-precision support.
+4. Launch Pixel Generator and choose GPU to force the RTX 3070 Ti, or Automatic to benchmark CPU vs GPU and cache a decision. The status line identifies the active renderer after a fractal is generated.
+5. Run `py -3 test_opencl_fractal_backend.py` to compare CPU/GPU image output on a PC with a compatible OpenCL GPU. Run `py -3 benchmark_cpu_gpu.py` for timings at 1920 × 1080 and 3840 × 2160.
+
+GPU benchmark note
+-----------------
+The development environment used to prepare this package has no compatible OpenCL GPU, so it cannot report RTX 3070 Ti timings. The included benchmark script measures your actual CPU and GPU on your PC; no GPU speedup is assumed or hard-coded. The first OpenCL render includes driver kernel compilation, which is excluded from the Automatic mode's warmed timing comparison.
+
+Interactive fractal exploration
+--------------------------------
+When a fractal is displayed, use the mouse wheel over the preview to zoom
+into or out of the point beneath the pointer. Click and drag the preview to
+pan; the image moves while dragging and is re-rendered on release using the
+selected Automatic, CPU or OpenCL GPU renderer. Use the Reset View button to
+return to the randomized starting viewport for that fractal. The same Julia
+and Phoenix parameters and color palette are retained while navigating.
+Changing image resolution or color depth preserves the current viewport.
+The selected quality/iteration setting is unchanged.

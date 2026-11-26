@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==============================================
-echo Random Pixel Image, GIF and H.264 Video Generator
+echo Pixel Generator - Numba + OpenCL GPU Fractal Edition
 echo ==============================================
 
 where py >nul 2>nul
@@ -25,11 +25,15 @@ if errorlevel 1 (
 py -3 -m pip install --upgrade pip
 if errorlevel 1 goto error
 
-py -3 -m pip install --upgrade numpy pillow imageio-ffmpeg ttkbootstrap==2.2.7 pyinstaller
+py -3 -m pip install --upgrade numpy "numba>=0.61.0" "llvmlite>=0.44.0" "pyopencl>=2025.2.6" pillow imageio-ffmpeg ttkbootstrap==2.2.7 pyinstaller pyinstaller-hooks-contrib
 if errorlevel 1 goto error
 
-rem NumPy is collected by PyInstaller's built-in hook. Avoid --collect-all numpy: it scans NumPy test packages and can warn about optional pytest.
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name RandomPixelGenerator --collect-all imageio_ffmpeg --collect-all ttkbootstrap random_pixel_generator.py
+py -3 -c "import numba, llvmlite, pyopencl; print('Numba', numba.__version__, '| llvmlite', llvmlite.__version__, '| PyOpenCL', pyopencl.VERSION_TEXT)"
+if errorlevel 1 goto error
+
+rem NumPy, Numba and llvmlite use PyInstaller's maintained hooks. PyOpenCL is collected narrowly: extension module, native DLLs, package data and metadata (avoid collecting its tests).
+rem The NVIDIA OpenCL driver/runtime is provided by the installed GeForce driver and is not bundled into this EXE.
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name RandomPixelGenerator --collect-all imageio_ffmpeg --collect-all ttkbootstrap --collect-binaries pyopencl --collect-data pyopencl --hidden-import pyopencl._cl --copy-metadata pyopencl random_pixel_generator.py
 if errorlevel 1 goto error
 
 echo.
