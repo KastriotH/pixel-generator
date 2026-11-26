@@ -23,8 +23,8 @@ VIDEO_DEFAULT_SECONDS = 10
 VIDEO_MIN_SECONDS = 1
 VIDEO_MAX_SECONDS = 60
 VIDEO_DEFAULT_BITRATE_KBPS = 200000
-GIF_WIDTH = 384
-GIF_HEIGHT = 216
+GIF_WIDTH = 192
+GIF_HEIGHT = 108
 GIF_DURATION_SECONDS = 5
 GIF_FPS = 30
 GIF_TOTAL_FRAMES = GIF_DURATION_SECONDS * GIF_FPS
@@ -657,7 +657,7 @@ def gif_frame_durations_ms(
 def encode_random_gif(
     output_path, depth, pixel_size=1, progress_callback=None, bilinear=False
 ):
-    """Export a fixed 384x216, 5-second, 30-FPS random animated GIF.
+    """Export a fixed 192x108, 5-second, 30-FPS random animated GIF.
 
     The selected color depth, pixel-block size and bilinear mode are used for
     every frame. GIF supports up to 256 colors per frame, so the complete
@@ -980,7 +980,7 @@ class RandomPixelGenerator:
 
         self.about_menu = tk.Menu(self.root, tearoff=0)
         self.about_menu.add_command(
-            label="Pixel Generator V1.2", command=self.show_about
+            label="Pixel Generator V1.1", command=self.show_about
         )
         self.about_menu_button = ttk.Menubutton(
             self.menu_bar, text="About", menu=self.about_menu
@@ -999,7 +999,7 @@ class RandomPixelGenerator:
 
         ttk.Label(
             content,
-            text="Pixel Generator V1.2",
+            text="Pixel Generator V1.1",
             font=("Segoe UI", 11, "bold"),
         ).pack(anchor="center", pady=(0, 10))
 
@@ -1356,7 +1356,7 @@ class RandomPixelGenerator:
         ).start()
 
     def export_gif(self):
-        """Export a fixed 384x216, 5-second animated GIF at 30 FPS."""
+        """Export a fixed 192x108, 5-second animated GIF at 30 FPS."""
         if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
             return
 

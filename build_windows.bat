@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==============================================
-echo Random Pixel Image and H.264 Video Generator
+echo Random Pixel Image, GIF and H.264 Video Generator
 echo ==============================================
 
 where py >nul 2>nul
