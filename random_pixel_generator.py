@@ -2,21 +2,26 @@ import json
 import math
 import os
 import platform
+import re
+import shutil
+import uuid
+from datetime import datetime
 import queue
 import random
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import imageio_ffmpeg
 import numba
 import numpy as np
 from numba import njit, prange
-from PIL import GifImagePlugin, Image, ImageTk
+from PIL import GifImagePlugin, Image, ImageColor, ImageTk
 
 try:
     import pyopencl as cl
@@ -33,6 +38,122 @@ except ImportError:  # GUI startup reports a clear message if themes are unavail
     ttkbootstrap = None
 
 
+class VideoExportCancelled(Exception):
+    """Raised internally when the user cancels an active video export."""
+
+
+class VideoExportControl:
+    """Thread-safe cancellation token that can also stop the active FFmpeg process."""
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._process = None
+
+    @property
+    def cancelled(self):
+        return self._event.is_set()
+
+    def check(self):
+        if self.cancelled:
+            raise VideoExportCancelled("Video export cancelled by user.")
+
+    def attach_process(self, process):
+        with self._lock:
+            self._process = process
+            should_terminate = self._event.is_set()
+        if should_terminate:
+            self._terminate_process(process)
+
+    def detach_process(self, process=None):
+        with self._lock:
+            if process is None or self._process is process:
+                self._process = None
+
+    @staticmethod
+    def _terminate_process(process):
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+
+    def cancel(self):
+        """Signal cancellation and terminate FFmpeg to unblock any pipe write."""
+        self._event.set()
+        with self._lock:
+            process = self._process
+        self._terminate_process(process)
+
+
+def _cleanup_video_process(process, timeout=5):
+    """Terminate/reap FFmpeg and close its streams without leaking handles."""
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+        # Always wait, even when poll() reports an exit code, so the OS has
+        # fully reaped the child and released its output-file handle.
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout)
+    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=timeout)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        try:
+            if stream is not None and not stream.closed:
+                stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _remove_incomplete_video_file(output_path, retries=40, delay=0.25):
+    """Reliably remove a cancelled/failed MP4 after FFmpeg releases its handle.
+
+    Windows can briefly keep the just-closed output locked by the process
+    teardown, antivirus scanning or thumbnail/indexing services. Retry sharing
+    violations and clear the read-only attribute before giving up. Returns
+    (removed, error_text) so the GUI never claims deletion succeeded falsely.
+    """
+    if not output_path:
+        return True, None
+    path = os.path.abspath(os.fspath(output_path))
+    last_error = None
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            if not os.path.exists(path):
+                return True, None
+            try:
+                # On Windows this also clears a read-only file attribute.
+                os.chmod(path, 0o666)
+            except OSError:
+                pass
+            os.remove(path)
+            return True, None
+        except FileNotFoundError:
+            return True, None
+        except OSError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(max(0.0, float(delay)))
+    try:
+        still_exists = os.path.exists(path)
+    except OSError:
+        still_exists = True
+    if not still_exists:
+        return True, None
+    return False, str(last_error or "The incomplete video file still exists.")
+
+
 IMAGE_MAX_SIDE = 20000
 IMAGE_MAX_PIXELS = 100_000_000
 VIDEO_MAX_PIXELS = 8_294_400  # 3840 × 2160
@@ -42,7 +163,13 @@ VIDEO_DEFAULT_FPS = 60
 VIDEO_DEFAULT_SECONDS = 10
 VIDEO_MIN_SECONDS = 1
 VIDEO_MAX_SECONDS = 60
-VIDEO_DEFAULT_BITRATE_KBPS = 200000
+VIDEO_DEFAULT_BITRATE_KBPS = 200000  # Fixed target for all bitrate-controlled exports
+VIDEO_QUALITY_MODE_QP = 12  # H.264 constant-quality level for random 1x1 video
+VIDEO_HEVC_QUALITY_MODE_CQ = 20  # Higher HEVC CQ reduces oversized 1x1 random-noise files
+VIDEO_HEVC_QUALITY_MODE_MAXRATE_KBPS = VIDEO_DEFAULT_BITRATE_KBPS  # 200 Mbit/s playback-friendly ceiling
+VIDEO_CODEC_OPTIONS = ("H.264", "H.265/HEVC")
+VIDEO_DEFAULT_CODEC = "H.265/HEVC"
+VIDEO_MAX_ROTATION_DEGREES = 720
 GIF_WIDTH = 384
 GIF_HEIGHT = 216
 GIF_DEFAULT_RESOLUTION = (GIF_WIDTH, GIF_HEIGHT)
@@ -262,6 +389,220 @@ def save_window_position(x, y, path=None):
         except OSError:
             pass
 
+
+
+# Fractal workspace data is stored separately from the existing UI preferences.
+MAX_FRACTAL_HISTORY = 100
+MAX_GALLERY_ITEMS = 250
+BATCH_GENERATION_COUNTS = (100, 1000)
+ANIMATION_DEFAULT_SECONDS = 5
+ANIMATION_DEFAULT_FPS = 30
+ANIMATION_ZOOM_OPTIONS = (2, 5, 10, 25, 50, 100, 250, 500, 1000)
+
+
+def get_fractal_workspace_dir():
+    return os.path.join(os.path.dirname(get_window_position_path()), "FractalWorkspace")
+
+
+def get_fractal_bookmarks_path():
+    return os.path.join(get_fractal_workspace_dir(), "bookmarks.json")
+
+
+def get_custom_palettes_path():
+    return os.path.join(get_fractal_workspace_dir(), "custom_palettes.json")
+
+
+def get_active_palette_path():
+    return os.path.join(get_fractal_workspace_dir(), "active_palette.json")
+
+
+def get_gallery_directory():
+    return os.path.join(get_fractal_workspace_dir(), "Gallery")
+
+
+def get_gallery_settings_path():
+    return os.path.join(get_fractal_workspace_dir(), "gallery_settings.json")
+
+
+def load_gallery_auto_save(path=None):
+    path = path or get_gallery_settings_path()
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            value = json.load(stream).get("auto_save", True)
+        return bool(value)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True
+
+
+def save_gallery_auto_save(enabled, path=None):
+    _atomic_write_json(path or get_gallery_settings_path(), {"auto_save": bool(enabled)})
+
+
+def _atomic_write_json(path, value):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary_path = path + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False)
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+
+
+def load_fractal_bookmarks(path=None):
+    path = path or get_fractal_bookmarks_path()
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict) and isinstance(item.get("view_state"), dict)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_fractal_bookmarks(bookmarks, path=None):
+    path = path or get_fractal_bookmarks_path()
+    if not isinstance(bookmarks, list):
+        raise ValueError("Bookmarks must be a list.")
+    _atomic_write_json(path, bookmarks)
+
+
+def normalize_palette_stops(stops):
+    """Validate and normalize a list of two or more hexadecimal RGB stops."""
+    if not isinstance(stops, (list, tuple)) or not 2 <= len(stops) <= 16:
+        raise ValueError("A custom gradient must contain between 2 and 16 color stops.")
+    normalized = []
+    for stop in stops:
+        if not isinstance(stop, str) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", stop.strip()):
+            raise ValueError(f"Invalid color stop {stop!r}; use #RRGGBB format.")
+        normalized.append(stop.strip().upper())
+    return normalized
+
+
+def load_custom_palettes(path=None):
+    path = path or get_custom_palettes_path()
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            raw = json.load(stream)
+        if not isinstance(raw, dict):
+            return {}
+        result = {}
+        for name, stops in raw.items():
+            if isinstance(name, str) and name.strip():
+                try:
+                    result[name.strip()] = normalize_palette_stops(stops)
+                except ValueError:
+                    continue
+        return result
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_custom_palettes(palettes, path=None):
+    path = path or get_custom_palettes_path()
+    if not isinstance(palettes, dict):
+        raise ValueError("Custom palettes must be a dictionary.")
+    clean = {}
+    for name, stops in palettes.items():
+        clean_name = str(name).strip()
+        if not clean_name or clean_name.lower() == "random":
+            raise ValueError("Choose a palette name other than 'Random'.")
+        clean[clean_name] = normalize_palette_stops(stops)
+    _atomic_write_json(path, clean)
+
+
+def load_active_palette(path=None):
+    path = path or get_active_palette_path()
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            name = json.load(stream).get("name", "Random")
+        return name if isinstance(name, str) else "Random"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "Random"
+
+
+def save_active_palette(name, path=None):
+    path = path or get_active_palette_path()
+    _atomic_write_json(path, {"name": str(name)})
+
+
+def sample_custom_palette(stops, count=256):
+    """Sample an RGB gradient into a uint8 lookup table."""
+    clean = normalize_palette_stops(stops)
+    colors = np.asarray([ImageColor.getrgb(color) for color in clean], dtype=np.float32)
+    source_positions = np.linspace(0.0, 1.0, len(colors), dtype=np.float32)
+    target_positions = np.linspace(0.0, 1.0, int(count), dtype=np.float32)
+    table = np.stack([
+        np.interp(target_positions, source_positions, colors[:, channel])
+        for channel in range(3)
+    ], axis=1)
+    return np.rint(table).clip(0, 255).astype(np.uint8)
+
+
+def save_gallery_entry(image, metadata, gallery_dir=None, max_items=MAX_GALLERY_ITEMS):
+    """Save a PNG plus JSON metadata and prune the oldest gallery entries."""
+    gallery_dir = gallery_dir or get_gallery_directory()
+    os.makedirs(gallery_dir, exist_ok=True)
+    entry_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
+    image_name = entry_id + ".png"
+    metadata_name = entry_id + ".json"
+    image_path = os.path.join(gallery_dir, image_name)
+    metadata_path = os.path.join(gallery_dir, metadata_name)
+    image.save(image_path, "PNG", optimize=False)
+    record = dict(metadata)
+    record.update({"id": entry_id, "image_file": image_name, "created": datetime.now().isoformat(timespec="seconds")})
+    _atomic_write_json(metadata_path, record)
+
+    entries = []
+    for filename in os.listdir(gallery_dir):
+        if filename.endswith(".json"):
+            path = os.path.join(gallery_dir, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    item = json.load(stream)
+                entries.append((str(item.get("created", "")), path, item))
+            except (OSError, ValueError, TypeError):
+                continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _created, old_meta_path, old_item in entries[max(1, int(max_items)):]:
+        try:
+            os.remove(old_meta_path)
+            old_image = os.path.join(gallery_dir, str(old_item.get("image_file", "")))
+            if os.path.isfile(old_image):
+                os.remove(old_image)
+        except OSError:
+            pass
+    return record
+
+
+def list_gallery_entries(gallery_dir=None):
+    gallery_dir = gallery_dir or get_gallery_directory()
+    entries = []
+    if not os.path.isdir(gallery_dir):
+        return entries
+    for filename in os.listdir(gallery_dir):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(gallery_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                item = json.load(stream)
+            image_path = os.path.join(gallery_dir, str(item.get("image_file", "")))
+            if os.path.isfile(image_path) and isinstance(item.get("view_state"), dict):
+                item["metadata_file"] = path
+                item["image_path"] = image_path
+                entries.append(item)
+        except (OSError, ValueError, TypeError):
+            continue
+    entries.sort(key=lambda item: str(item.get("created", "")), reverse=True)
+    return entries
 
 def get_theme_preference_path():
     """Return the per-user file used to remember the selected visual theme."""
@@ -530,6 +871,8 @@ __kernel void fractal_render(
     const int color_count,
     const float palette_phase,
     const float palette_cycles,
+    __global const uchar *custom_palette_rgb,
+    const int custom_palette_count,
     const int red_bits,
     const int green_bits,
     const int blue_bits)
@@ -657,23 +1000,33 @@ __kernel void fractal_render(
 
     const float normalized = clamp(
         smooth_value / (float)max_iterations, 0.0f, 1.0f);
-    float hue = fmod(palette_phase + normalized * palette_cycles, 1.0f);
-    if (hue < 0.0f) hue += 1.0f;
-    const float h6 = hue * 6.0f;
-    const int sector = (int)floor(h6);
-    const float fraction = h6 - floor(h6);
-    const float p = 0.08f;
-    const float q = 1.0f - 0.92f * fraction;
-    const float t = 0.08f + 0.92f * fraction;
     float red;
     float green;
     float blue;
-    if (sector == 0) { red = 1.0f; green = t; blue = p; }
-    else if (sector == 1) { red = q; green = 1.0f; blue = p; }
-    else if (sector == 2) { red = p; green = 1.0f; blue = t; }
-    else if (sector == 3) { red = p; green = q; blue = 1.0f; }
-    else if (sector == 4) { red = t; green = p; blue = 1.0f; }
-    else { red = 1.0f; green = p; blue = q; }
+    if (custom_palette_count >= 2) {
+        const float palette_position = normalized * (float)(custom_palette_count - 1);
+        const int lower = min((int)floor(palette_position), custom_palette_count - 1);
+        const int upper = min(lower + 1, custom_palette_count - 1);
+        const float blend = palette_position - (float)lower;
+        red = mix((float)custom_palette_rgb[lower * 3], (float)custom_palette_rgb[upper * 3], blend) / 255.0f;
+        green = mix((float)custom_palette_rgb[lower * 3 + 1], (float)custom_palette_rgb[upper * 3 + 1], blend) / 255.0f;
+        blue = mix((float)custom_palette_rgb[lower * 3 + 2], (float)custom_palette_rgb[upper * 3 + 2], blend) / 255.0f;
+    } else {
+        float hue = fmod(palette_phase + normalized * palette_cycles, 1.0f);
+        if (hue < 0.0f) hue += 1.0f;
+        const float h6 = hue * 6.0f;
+        const int sector = (int)floor(h6);
+        const float fraction = h6 - floor(h6);
+        const float p = 0.08f;
+        const float q = 1.0f - 0.92f * fraction;
+        const float t = 0.08f + 0.92f * fraction;
+        if (sector == 0) { red = 1.0f; green = t; blue = p; }
+        else if (sector == 1) { red = q; green = 1.0f; blue = p; }
+        else if (sector == 2) { red = p; green = 1.0f; blue = t; }
+        else if (sector == 3) { red = p; green = q; blue = 1.0f; }
+        else if (sector == 4) { red = t; green = p; blue = 1.0f; }
+        else { red = 1.0f; green = p; blue = q; }
+    }
 
     const int channel_bits[3] = {red_bits, green_bits, blue_bits};
     const float channels[3] = {red, green, blue};
@@ -684,6 +1037,243 @@ __kernel void fractal_render(
         const float restored = rint(quantized * 255.0f / (float)levels);
         output_pixels[output_index + channel] = convert_uchar_sat_rte(restored);
     }
+}
+"""
+
+
+OPENCL_VIDEO_KERNEL_SOURCE = r"""
+inline uint pg_hash_u32(uint value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+inline float3 pg_random_cell_color(
+    const int cell_x,
+    const int cell_y,
+    const int frame_number,
+    const int depth,
+    const int color_count,
+    const int red_bits,
+    const int green_bits,
+    const int blue_bits,
+    __global const uchar *palette,
+    const uint seed)
+{
+    uint base = seed
+        ^ ((uint)frame_number * 0x9e3779b9U)
+        ^ ((uint)cell_x * 0x85ebca6bU)
+        ^ ((uint)cell_y * 0xc2b2ae35U);
+    if (depth <= 8) {
+        const uint index = pg_hash_u32(base) % (uint)color_count;
+        const int offset = (int)index * 3;
+        return (float3)(
+            (float)palette[offset],
+            (float)palette[offset + 1],
+            (float)palette[offset + 2]);
+    }
+
+    const int red_max = (1 << red_bits) - 1;
+    const int green_max = (1 << green_bits) - 1;
+    const int blue_max = (1 << blue_bits) - 1;
+    const uint rv = pg_hash_u32(base ^ 0x68bc21ebU) % (uint)(red_max + 1);
+    const uint gv = pg_hash_u32(base ^ 0x02e5be93U) % (uint)(green_max + 1);
+    const uint bv = pg_hash_u32(base ^ 0x967a889bU) % (uint)(blue_max + 1);
+    const uint red = (rv * 255U + (uint)(red_max / 2)) / (uint)red_max;
+    const uint green = (gv * 255U + (uint)(green_max / 2)) / (uint)green_max;
+    const uint blue = (bv * 255U + (uint)(blue_max / 2)) / (uint)blue_max;
+    return (float3)((float)red, (float)green, (float)blue);
+}
+
+inline float3 pg_grid_sample(
+    const float grid_x,
+    const float grid_y,
+    const int frame_number,
+    const int depth,
+    const int color_count,
+    const int red_bits,
+    const int green_bits,
+    const int blue_bits,
+    const int grid_width,
+    const int grid_height,
+    __global const uchar *palette,
+    const uint seed)
+{
+    const float clamped_x = clamp(grid_x, 0.0f, (float)(grid_width - 1));
+    const float clamped_y = clamp(grid_y, 0.0f, (float)(grid_height - 1));
+    const int x0 = (int)floor(clamped_x);
+    const int y0 = (int)floor(clamped_y);
+    const int x1 = min(x0 + 1, grid_width - 1);
+    const int y1 = min(y0 + 1, grid_height - 1);
+    const float tx = clamped_x - (float)x0;
+    const float ty = clamped_y - (float)y0;
+    const float3 c00 = pg_random_cell_color(x0, y0, frame_number, depth,
+        color_count, red_bits, green_bits, blue_bits, palette, seed);
+    const float3 c10 = pg_random_cell_color(x1, y0, frame_number, depth,
+        color_count, red_bits, green_bits, blue_bits, palette, seed);
+    const float3 c01 = pg_random_cell_color(x0, y1, frame_number, depth,
+        color_count, red_bits, green_bits, blue_bits, palette, seed);
+    const float3 c11 = pg_random_cell_color(x1, y1, frame_number, depth,
+        color_count, red_bits, green_bits, blue_bits, palette, seed);
+    return mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+}
+
+inline float3 pg_random_source_pixel(
+    const int x,
+    const int y,
+    const int frame_number,
+    const int width,
+    const int height,
+    const int depth,
+    const int pixel_size,
+    const int bilinear,
+    const int color_count,
+    const int red_bits,
+    const int green_bits,
+    const int blue_bits,
+    const int grid_width,
+    const int grid_height,
+    __global const uchar *palette,
+    const uint seed)
+{
+    if (x < 0 || x >= width || y < 0 || y >= height)
+        return (float3)(0.0f, 0.0f, 0.0f);
+
+    if (!bilinear) {
+        return pg_random_cell_color(
+            x / pixel_size, y / pixel_size, frame_number, depth, color_count,
+            red_bits, green_bits, blue_bits, palette, seed);
+    }
+
+    // Match the pixel-center mapping used by Pillow's bilinear resize.
+    const float gx = ((float)x + 0.5f) * (float)grid_width / (float)width - 0.5f;
+    const float gy = ((float)y + 0.5f) * (float)grid_height / (float)height - 0.5f;
+    return pg_grid_sample(gx, gy, frame_number, depth, color_count,
+        red_bits, green_bits, blue_bits, grid_width, grid_height, palette, seed);
+}
+
+__kernel void pg_random_rotated_video_frames(
+    __global uchar *output_pixels,
+    const int width,
+    const int height,
+    const int depth,
+    const int pixel_size,
+    const int bilinear,
+    const int color_count,
+    const int red_bits,
+    const int green_bits,
+    const int blue_bits,
+    const int grid_width,
+    const int grid_height,
+    __global const uchar *palette,
+    const uint seed,
+    const int first_frame,
+    const int total_frames,
+    const float rotation_degrees,
+    const float direction_sign)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    const int batch_frame = (int)get_global_id(2);
+    const int batch_count = (int)get_global_size(2);
+    if (x >= width || y >= height || batch_frame >= batch_count) return;
+
+    const int frame_number = first_frame + batch_frame;
+    const float progress = (total_frames <= 1) ? 1.0f
+        : (float)frame_number / (float)(total_frames - 1);
+    const float angle = rotation_degrees * direction_sign * progress
+        * 0.01745329251994329577f;
+    const float cs = cos(angle);
+    const float sn = sin(angle);
+    const float center_x = ((float)width - 1.0f) * 0.5f;
+    const float center_y = ((float)height - 1.0f) * 0.5f;
+    const float dx = (float)x - center_x;
+    const float dy = (float)y - center_y;
+    // Inverse transform: positive angle is visually clockwise in image coordinates.
+    const float source_x = center_x + cs * dx + sn * dy;
+    const float source_y = center_y - sn * dx + cs * dy;
+    // Random pixel art is high-frequency by design. Bilinear rotation blends
+    // neighboring random colors as soon as the angle becomes non-zero, which
+    // visibly washes out the image and reduces contrast from frame 2 onward.
+    // Use nearest-neighbor for the geometric rotation so source colors remain
+    // crisp. The separate `bilinear` option is still honored by
+    // pg_random_source_pixel() when scaling the pixel grid.
+    const int nearest_x = (int)floor(source_x + 0.5f);
+    const int nearest_y = (int)floor(source_y + 0.5f);
+    const float3 result = pg_random_source_pixel(
+        nearest_x, nearest_y, frame_number, width, height, depth, pixel_size,
+        bilinear, color_count, red_bits, green_bits, blue_bits,
+        grid_width, grid_height, palette, seed);
+
+    const int output_index = ((batch_frame * height + y) * width + x) * 3;
+    output_pixels[output_index] = convert_uchar_sat_rte(result.x);
+    output_pixels[output_index + 1] = convert_uchar_sat_rte(result.y);
+    output_pixels[output_index + 2] = convert_uchar_sat_rte(result.z);
+}
+
+inline float3 pg_read_rgb(
+    __global const uchar *input_pixels,
+    const int frame_number,
+    const int width,
+    const int height,
+    const int x,
+    const int y)
+{
+    if (x < 0 || x >= width || y < 0 || y >= height)
+        return (float3)(0.0f, 0.0f, 0.0f);
+    const int index = ((frame_number * height + y) * width + x) * 3;
+    return (float3)((float)input_pixels[index],
+        (float)input_pixels[index + 1], (float)input_pixels[index + 2]);
+}
+
+__kernel void pg_rotate_rgb_video_frames(
+    __global const uchar *input_pixels,
+    __global uchar *output_pixels,
+    const int width,
+    const int height,
+    const int first_frame,
+    const int total_frames,
+    const float rotation_degrees,
+    const float direction_sign)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    const int batch_frame = (int)get_global_id(2);
+    const int batch_count = (int)get_global_size(2);
+    if (x >= width || y >= height || batch_frame >= batch_count) return;
+    const int frame_number = first_frame + batch_frame;
+    const float progress = (total_frames <= 1) ? 1.0f
+        : (float)frame_number / (float)(total_frames - 1);
+    const float angle = rotation_degrees * direction_sign * progress
+        * 0.01745329251994329577f;
+    const float cs = cos(angle);
+    const float sn = sin(angle);
+    const float cx = ((float)width - 1.0f) * 0.5f;
+    const float cy = ((float)height - 1.0f) * 0.5f;
+    const float dx = (float)x - cx;
+    const float dy = (float)y - cy;
+    const float sx = cx + cs * dx + sn * dy;
+    const float sy = cy - sn * dx + cs * dy;
+    const int x0 = (int)floor(sx);
+    const int y0 = (int)floor(sy);
+    const float tx = sx - (float)x0;
+    const float ty = sy - (float)y0;
+    const float3 c00 = pg_read_rgb(input_pixels, batch_frame, width, height, x0, y0);
+    float3 result = c00;
+    if (fabs(angle) > 1.0e-7f) {
+        const float3 c10 = pg_read_rgb(input_pixels, batch_frame, width, height, x0 + 1, y0);
+        const float3 c01 = pg_read_rgb(input_pixels, batch_frame, width, height, x0, y0 + 1);
+        const float3 c11 = pg_read_rgb(input_pixels, batch_frame, width, height, x0 + 1, y0 + 1);
+        result = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    }
+    const int output_index = ((batch_frame * height + y) * width + x) * 3;
+    output_pixels[output_index] = convert_uchar_sat_rte(result.x);
+    output_pixels[output_index + 1] = convert_uchar_sat_rte(result.y);
+    output_pixels[output_index + 2] = convert_uchar_sat_rte(result.z);
 }
 """
 
@@ -713,6 +1303,115 @@ class OpenCLFractalRenderer:
                 "Update the GPU driver and verify that its OpenCL runtime is installed. "
                 f"OpenCL details: {type(exc).__name__}: {exc}"
             ) from exc
+
+    def _ensure_video_kernels(self):
+        """Build the lightweight video kernels lazily on the selected OpenCL device."""
+        if getattr(self, "video_program", None) is not None:
+            return
+        try:
+            self.video_program = cl.Program(
+                self.context, OPENCL_VIDEO_KERNEL_SOURCE
+            ).build(options=["-cl-std=CL1.2"])
+            self.random_video_kernel = cl.Kernel(
+                self.video_program, "pg_random_rotated_video_frames"
+            )
+            self.rotate_video_kernel = cl.Kernel(
+                self.video_program, "pg_rotate_rgb_video_frames"
+            )
+        except Exception as exc:
+            self.video_program = None
+            raise RuntimeError(
+                f"Could not compile the OpenCL video kernels on "
+                f"{opencl_device_label(self.device)}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def render_random_video_batch(
+        self, width, height, depth, pixel_size, bilinear, palette,
+        seed, first_frame, total_frames, rotation_degrees,
+        rotation_direction, batch_frames,
+    ):
+        """Generate fresh random frames and rotate them in one OpenCL pass."""
+        self._ensure_video_kernels()
+        width, height, depth = int(width), int(height), int(depth)
+        pixel_size = int(pixel_size)
+        first_frame, total_frames = int(first_frame), int(total_frames)
+        batch_frames = int(batch_frames)
+        palette = np.ascontiguousarray(palette, dtype=np.uint8).reshape(-1, 3)
+        if width < 1 or height < 1 or batch_frames < 1:
+            raise ValueError("OpenCL video frame dimensions and batch size must be positive.")
+        grid_width = (width + pixel_size - 1) // pixel_size
+        grid_height = (height + pixel_size - 1) // pixel_size
+        channel_bits = _depth_channel_bits(depth) if depth > 8 else (8, 8, 8)
+        direction_sign = 1.0 if str(rotation_direction) == "Clockwise" else -1.0
+        flags = cl.mem_flags
+        palette_key = palette.tobytes()
+        if getattr(self, "_video_palette_key", None) != palette_key:
+            self._video_palette_buffer = cl.Buffer(
+                self.context, flags.READ_ONLY | flags.COPY_HOST_PTR, hostbuf=palette
+            )
+            self._video_palette_key = palette_key
+        palette_buffer = self._video_palette_buffer
+        required_bytes = batch_frames * width * height * 3
+        if (getattr(self, "_random_video_output_buffer", None) is None
+                or getattr(self, "_random_video_output_capacity", 0) < required_bytes):
+            self._random_video_output_buffer = cl.Buffer(
+                self.context, flags.WRITE_ONLY, size=required_bytes
+            )
+            self._random_video_output_capacity = required_bytes
+        output_buffer = self._random_video_output_buffer
+        self.random_video_kernel(
+            self.queue, (width, height, batch_frames), None,
+            output_buffer,
+            np.int32(width), np.int32(height), np.int32(depth),
+            np.int32(pixel_size), np.int32(bool(bilinear)),
+            np.int32(len(palette)),
+            np.int32(channel_bits[0]), np.int32(channel_bits[1]),
+            np.int32(channel_bits[2]), np.int32(grid_width), np.int32(grid_height),
+            palette_buffer, np.uint32(seed), np.int32(first_frame),
+            np.int32(total_frames), np.float32(rotation_degrees),
+            np.float32(direction_sign),
+        )
+        output = np.empty((batch_frames, height, width, 3), dtype=np.uint8)
+        cl.enqueue_copy(self.queue, output, output_buffer, is_blocking=True)
+        return output
+
+    def rotate_rgb_batch(
+        self, rgb_frames, first_frame, total_frames,
+        rotation_degrees, rotation_direction,
+    ):
+        """Rotate one or more RGB frames on the OpenCL device."""
+        self._ensure_video_kernels()
+        frames = np.ascontiguousarray(rgb_frames, dtype=np.uint8)
+        if frames.ndim != 4 or frames.shape[-1] != 3:
+            raise ValueError("RGB video batch must have shape (frames, height, width, 3).")
+        batch_frames, height, width, _channels = frames.shape
+        if batch_frames < 1 or width < 1 or height < 1:
+            raise ValueError("OpenCL rotation batch must contain at least one image.")
+        direction_sign = 1.0 if str(rotation_direction) == "Clockwise" else -1.0
+        flags = cl.mem_flags
+        required_bytes = frames.nbytes
+        if (getattr(self, "_rotate_video_input_buffer", None) is None
+                or getattr(self, "_rotate_video_buffer_capacity", 0) < required_bytes):
+            self._rotate_video_input_buffer = cl.Buffer(
+                self.context, flags.READ_ONLY, size=required_bytes
+            )
+            self._rotate_video_output_buffer = cl.Buffer(
+                self.context, flags.WRITE_ONLY, size=required_bytes
+            )
+            self._rotate_video_buffer_capacity = required_bytes
+        input_buffer = self._rotate_video_input_buffer
+        output_buffer = self._rotate_video_output_buffer
+        cl.enqueue_copy(self.queue, input_buffer, frames, is_blocking=False)
+        self.rotate_video_kernel(
+            self.queue, (width, height, batch_frames), None,
+            input_buffer, output_buffer,
+            np.int32(width), np.int32(height), np.int32(first_frame),
+            np.int32(total_frames), np.float32(rotation_degrees),
+            np.float32(direction_sign),
+        )
+        output = np.empty_like(frames)
+        cl.enqueue_copy(self.queue, output, output_buffer, is_blocking=True)
+        return output
 
     def iter_escape_chunks(
         self,
@@ -796,6 +1495,7 @@ class OpenCLFractalRenderer:
         color_count,
         palette_phase,
         palette_cycles,
+        custom_palette_rgb=None,
     ):
         """Render final palette-index or RGB pixels entirely on the GPU.
 
@@ -830,6 +1530,17 @@ class OpenCLFractalRenderer:
         output_buffer = cl.Buffer(
             self.context, flags.WRITE_ONLY, size=width * height * channels
         )
+        if custom_palette_rgb is None:
+            custom_palette_rgb = np.asarray([[0, 0, 0], [255, 255, 255]], dtype=np.uint8)
+            custom_palette_count = 0
+        else:
+            custom_palette_rgb = np.ascontiguousarray(custom_palette_rgb, dtype=np.uint8)
+            if custom_palette_rgb.ndim != 2 or custom_palette_rgb.shape[1] != 3 or custom_palette_rgb.shape[0] < 2:
+                raise ValueError("Custom GPU palette must be an RGB table with at least two entries.")
+            custom_palette_count = int(custom_palette_rgb.shape[0])
+        custom_palette_buffer = cl.Buffer(
+            self.context, flags.READ_ONLY | flags.COPY_HOST_PTR, hostbuf=custom_palette_rgb
+        )
         channel_bits = _depth_channel_bits(depth) if not indexed else (8, 8, 8)
 
         self.render_kernel(
@@ -850,6 +1561,8 @@ class OpenCLFractalRenderer:
             np.int32(color_count),
             np.float32(palette_phase),
             np.float32(palette_cycles),
+            custom_palette_buffer,
+            np.int32(custom_palette_count),
             np.int32(channel_bits[0]),
             np.int32(channel_bits[1]),
             np.int32(channel_bits[2]),
@@ -1804,6 +2517,28 @@ def zoom_fractal_view(view_state, cursor_x_ratio, cursor_y_ratio, zoom_factor,
     return state
 
 
+def interpolate_fractal_view_states(start_state, end_state, progress):
+    """Interpolate a viewport smoothly, using logarithmic zoom scaling."""
+    progress = min(1.0, max(0.0, float(progress)))
+    if progress <= 0.0:
+        return dict(start_state)
+    if progress >= 1.0:
+        return dict(end_state)
+    state = dict(start_state)
+    for key in ("center_real", "center_imag"):
+        state[key] = (
+            float(start_state[key])
+            + (float(end_state[key]) - float(start_state[key])) * progress
+        )
+    start_span = max(float(start_state["horizontal_span"]), 1e-300)
+    end_span = max(float(end_state["horizontal_span"]), 1e-300)
+    state["horizontal_span"] = math.exp(
+        math.log(start_span)
+        + (math.log(end_span) - math.log(start_span)) * progress
+    )
+    return state
+
+
 def reset_fractal_view_state(view_state):
     """Return a view to the randomized starting viewport used for this fractal."""
     state = dict(view_state)
@@ -1825,6 +2560,7 @@ def generate_fractal_image(
     opencl_renderer=None,
     view_state=None,
     return_view_state=False,
+    custom_palette=None,
 ):
     """Generate a randomized or user-positioned view of a fractal family.
 
@@ -1865,6 +2601,10 @@ def generate_fractal_image(
         raise ValueError("Fractal row chunk size must be positive.")
 
     rng = np.random.default_rng() if rng is None else rng
+    if custom_palette is None and isinstance(view_state, dict):
+        custom_palette = view_state.get("palette_stops")
+    custom_palette_stops = normalize_palette_stops(custom_palette) if custom_palette else None
+    custom_palette_table = sample_custom_palette(custom_palette_stops, 256) if custom_palette_stops else None
 
     # Distinct, useful coordinate neighborhoods for each family. Repeated
     # generations select another center, zoom level and color spectrum.
@@ -2002,6 +2742,7 @@ def generate_fractal_image(
             "phoenix_p_imag": float(phoenix_p_imag),
             "palette_phase": float(palette_phase),
             "palette_cycles": float(palette_cycles),
+            "palette_stops": list(custom_palette_stops) if custom_palette_stops else None,
         }
     else:
         if view_state.get("fractal_type", fractal_type) != fractal_type:
@@ -2018,18 +2759,26 @@ def generate_fractal_image(
             "center_real": float(center_real),
             "center_imag": float(center_imag),
             "horizontal_span": float(horizontal_span),
+            "palette_stops": list(custom_palette_stops) if custom_palette_stops else None,
         })
 
 
     indexed = depth <= 8
     color_count = 1 << depth
     if depth == 1:
-        palette_rgb = np.asarray([(0, 0, 0), (255, 255, 255)], dtype=np.uint8)
+        if custom_palette_stops:
+            endpoints = sample_custom_palette(custom_palette_stops, 2)
+            palette_rgb = endpoints
+        else:
+            palette_rgb = np.asarray([(0, 0, 0), (255, 255, 255)], dtype=np.uint8)
     elif indexed:
-        palette_t = np.linspace(0.0, 1.0, color_count - 1, dtype=np.float32)
-        palette_hue = (palette_phase + palette_t * palette_cycles) % 1.0
         palette_rgb = np.zeros((color_count, 3), dtype=np.uint8)
-        palette_rgb[1:] = _hsv_to_rgb_array(palette_hue)
+        if custom_palette_stops:
+            palette_rgb[1:] = sample_custom_palette(custom_palette_stops, color_count - 1)
+        else:
+            palette_t = np.linspace(0.0, 1.0, color_count - 1, dtype=np.float32)
+            palette_hue = (palette_phase + palette_t * palette_cycles) % 1.0
+            palette_rgb[1:] = _hsv_to_rgb_array(palette_hue)
     else:
         palette_rgb = None
 
@@ -2044,20 +2793,17 @@ def generate_fractal_image(
         # The complete OpenCL kernel writes final indexed/RGB pixels directly.
         # Only the final image bytes cross PCIe; no float escape map, boolean
         # mask, HSV conversion or bit-depth quantization runs on the CPU.
-        gpu_pixels = opencl_renderer.render_final_pixels(
-            x_coordinates,
-            y_coordinates,
-            fractal_code,
-            max_iterations,
-            julia_c_real,
-            julia_c_imag,
-            phoenix_p_real,
-            phoenix_p_imag,
-            depth,
-            color_count,
-            palette_phase,
-            palette_cycles,
+        render_arguments = (
+            x_coordinates, y_coordinates, fractal_code, max_iterations,
+            julia_c_real, julia_c_imag, phoenix_p_real, phoenix_p_imag,
+            depth, color_count, palette_phase, palette_cycles,
         )
+        if custom_palette_table is not None:
+            gpu_pixels = opencl_renderer.render_final_pixels(
+                *render_arguments, custom_palette_rgb=custom_palette_table
+            )
+        else:
+            gpu_pixels = opencl_renderer.render_final_pixels(*render_arguments)
         if indexed:
             image = Image.frombytes("P", (width, height), gpu_pixels.tobytes())
             flat_palette = palette_rgb.reshape(-1).tolist()
@@ -2101,8 +2847,18 @@ def generate_fractal_image(
                 )
                 chunk_output[escaped] = color_indices.astype(np.uint8)
             else:
-                hue = (palette_phase + normalized * palette_cycles) % 1.0
-                chunk_output = _hsv_to_rgb_array(hue)
+                if custom_palette_table is not None:
+                    palette_position = normalized * float(len(custom_palette_table) - 1)
+                    lower = np.floor(palette_position).astype(np.int32)
+                    upper = np.minimum(lower + 1, len(custom_palette_table) - 1)
+                    blend = (palette_position - lower).astype(np.float32)[..., None]
+                    chunk_output = np.rint(
+                        custom_palette_table[lower].astype(np.float32) * (1.0 - blend)
+                        + custom_palette_table[upper].astype(np.float32) * blend
+                    ).clip(0, 255).astype(np.uint8)
+                else:
+                    hue = (palette_phase + normalized * palette_cycles) % 1.0
+                    chunk_output = _hsv_to_rgb_array(hue)
                 chunk_output[~escaped] = (0, 0, 0)
                 for channel, bits in enumerate(_depth_channel_bits(depth)):
                     levels = (1 << bits) - 1
@@ -2201,8 +2957,386 @@ def pixelate_image(image, pixel_size=1, bilinear=False):
     return Image.fromarray(expanded.astype(np.uint8), mode=image.mode)
 
 
-def encode_random_h264_video(output_path, width, height, depth, duration_seconds=VIDEO_DEFAULT_SECONDS, fps=VIDEO_DEFAULT_FPS, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS, pixel_size=1, progress_callback=None, bilinear=False):
-    """Create an H.264 MP4 with a fresh random pattern on every output frame."""
+def _opencl_video_batch_size(width, height):
+    """Choose a batch that keeps GPU allocations bounded on 1080p and 4K."""
+    bytes_per_frame = max(1, int(width) * int(height) * 3)
+    target_batch_bytes = 32 * 1024 * 1024
+    return max(1, min(4, target_batch_bytes // bytes_per_frame))
+
+
+def _ffmpeg_video_output_filter():
+    """Format frames already rotated on the GPU for broadly compatible HEVC."""
+    return "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"
+
+
+_VIDEO_ENCODER_CACHE = None
+_VIDEO_ENCODER_CACHE_LOCK = threading.Lock()
+
+
+def normalize_video_codec(codec):
+    """Normalize user-facing codec labels to the internal h264/hevc keys."""
+    value = str(codec).strip().lower().replace(" ", "")
+    if value in ("h264", "h.264", "avc", "h.264/avc"):
+        return "h264"
+    if value in ("h265", "h.265", "hevc", "h.265/hevc"):
+        return "hevc"
+    raise ValueError("Video codec must be H.264 or H.265/HEVC.")
+
+
+def video_codec_label(codec):
+    return "H.264/AVC" if normalize_video_codec(codec) == "h264" else "H.265/HEVC"
+
+
+def _ffmpeg_binary_candidates():
+    """Return system FFmpeg first, followed by the imageio-bundled fallback."""
+    candidates = []
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        candidates.append(system_ffmpeg)
+    try:
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled_ffmpeg:
+            candidates.append(bundled_ffmpeg)
+    except Exception:
+        pass
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized not in seen and os.path.isfile(candidate):
+            seen.add(normalized)
+            unique.append(candidate)
+    return unique
+
+
+def _ffmpeg_encoder_listing(ffmpeg_exe):
+    """Read FFmpeg's available encoder list, raising a useful error on failure."""
+    result = subprocess.run(
+        [ffmpeg_exe, "-hide_banner", "-encoders"],
+        capture_output=True, text=True, timeout=30, check=False,
+        **hidden_subprocess_options(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Could not inspect FFmpeg encoders: {detail}")
+    return result.stdout
+
+
+def _probe_nvenc_encoder(ffmpeg_exe, encoder_name, quality_mode=False):
+    """Initialize the requested NVENC rate-control mode before selecting it.
+
+    A successful VBR probe does not guarantee that the driver's constant-QP
+    path is usable. 1x1 random-pixel exports use constant QP, so probe that
+    exact mode separately and choose the CPU encoder before opening the real
+    frame pipe when NVENC cannot initialize it.
+    """
+    probe_width = 256
+    probe_height = 256
+    # Exercise several quality-mode frames during capability detection, not
+    # just encoder initialization on a single frame. This catches rate-control
+    # or GOP failures before the application's real frame pipe is opened.
+    probe_frames = 8 if quality_mode else 1
+    test_frame = bytes(probe_width * probe_height * 3) * probe_frames
+    if quality_mode and encoder_name == "h264_nvenc":
+        # Independent random frames: no temporal prediction or adaptive QP.
+        # VBR-CQ is more robust than constqp on some Windows driver builds.
+        encoder_args = [
+            "-c:v", encoder_name, "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-cq", str(VIDEO_QUALITY_MODE_QP), "-b:v", "0",
+            "-g", "0", "-bf", "0", "-rc-lookahead", "0",
+            "-spatial-aq", "0", "-temporal-aq", "0",
+        ]
+    elif quality_mode and encoder_name == "hevc_nvenc":
+        # Match H.264's intra-only noise handling, but cap HEVC at 200 Mbit/s.
+        # CQ 20 (rather than QP 12) avoids the multi-gigabit HEVC output that
+        # can overwhelm common desktop players at 1080p120.
+        maxrate = VIDEO_HEVC_QUALITY_MODE_MAXRATE_KBPS
+        encoder_args = [
+            "-c:v", encoder_name, "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-cq", str(VIDEO_HEVC_QUALITY_MODE_CQ),
+            "-b:v", f"{maxrate}k", "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{maxrate * 2}k",
+            "-g", "0", "-bf", "0", "-rc-lookahead", "0",
+            "-spatial-aq", "0", "-temporal-aq", "0",
+        ]
+    else:
+        encoder_args = [
+            "-c:v", encoder_name, "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-b:v", "1000k", "-maxrate", "1000k",
+            "-bufsize", "2000k",
+        ]
+    command = [
+        ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", f"{probe_width}x{probe_height}", "-framerate", "30", "-i", "pipe:0",
+        "-frames:v", str(probe_frames), "-an", *encoder_args,
+        "-pix_fmt", "yuv420p", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            command, input=test_frame, capture_output=True, text=False,
+            timeout=20, check=False, **hidden_subprocess_options(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"NVENC probe could not run: {exc}"
+    if result.returncode == 0:
+        return True, None
+    detail = (result.stderr or result.stdout or b"").decode(
+        "utf-8", errors="replace"
+    ).strip()
+    detail = detail[:500] if detail else ""
+    return False, detail or f"NVENC probe exited with code {result.returncode}."
+
+
+def _probe_hevc_nvenc(ffmpeg_exe, quality_mode=False):
+    """Backward-compatible HEVC NVENC probe wrapper."""
+    return _probe_nvenc_encoder(ffmpeg_exe, "hevc_nvenc", quality_mode=quality_mode)
+
+
+def _probe_h264_nvenc(ffmpeg_exe, quality_mode=False):
+    """Probe the NVIDIA H.264 encoder."""
+    return _probe_nvenc_encoder(ffmpeg_exe, "h264_nvenc", quality_mode=quality_mode)
+
+
+def select_video_encoder(codec=VIDEO_DEFAULT_CODEC, force_refresh=False, quality_mode=False):
+    """Prefer NVENC for the codec and requested rate-control mode, then use CPU."""
+    global _VIDEO_ENCODER_CACHE
+    codec_key = normalize_video_codec(codec)
+    nvenc_name = "h264_nvenc" if codec_key == "h264" else "hevc_nvenc"
+    software_name = "libx264" if codec_key == "h264" else "libx265"
+    pretty_codec = video_codec_label(codec)
+    probe = _probe_h264_nvenc if codec_key == "h264" else _probe_hevc_nvenc
+    quality_mode = bool(quality_mode)
+    cache_key = (codec_key, quality_mode)
+
+    with _VIDEO_ENCODER_CACHE_LOCK:
+        if not isinstance(_VIDEO_ENCODER_CACHE, dict):
+            _VIDEO_ENCODER_CACHE = {}
+        if cache_key in _VIDEO_ENCODER_CACHE and not force_refresh:
+            return dict(_VIDEO_ENCODER_CACHE[cache_key])
+
+        candidates = _ffmpeg_binary_candidates()
+        if not candidates:
+            raise RuntimeError(
+                "FFmpeg was not found. Install FFmpeg or reinstall imageio-ffmpeg."
+            )
+
+        inspected = []
+        nvenc_failures = []
+        listing_errors = []
+        for ffmpeg_exe in candidates:
+            try:
+                listing = _ffmpeg_encoder_listing(ffmpeg_exe)
+            except Exception as exc:
+                listing_errors.append(f"{ffmpeg_exe}: {exc}")
+                continue
+            inspected.append((ffmpeg_exe, listing))
+
+        for ffmpeg_exe, listing in inspected:
+            if nvenc_name not in listing:
+                continue
+            available, reason = probe(ffmpeg_exe, quality_mode=quality_mode)
+            if available:
+                selected = {
+                    "ffmpeg": ffmpeg_exe,
+                    "encoder": nvenc_name,
+                    "codec": pretty_codec,
+                    "codec_key": codec_key,
+                    "label": f"NVIDIA NVENC hardware encoder ({pretty_codec})",
+                    "hardware": True,
+                    "fallback_reason": None,
+                }
+                _VIDEO_ENCODER_CACHE[cache_key] = dict(selected)
+                return selected
+            nvenc_failures.append(f"{ffmpeg_exe}: {reason}")
+
+        for ffmpeg_exe, listing in inspected:
+            if software_name not in listing:
+                continue
+            reasons = nvenc_failures or (
+                [f"NVENC is not included (missing {nvenc_name}) in the available FFmpeg builds."]
+                if not any(nvenc_name in item[1] for item in inspected) else []
+            )
+            fallback_reason = "; ".join(reasons) if reasons else None
+            selected = {
+                "ffmpeg": ffmpeg_exe,
+                "encoder": software_name,
+                "codec": pretty_codec,
+                "codec_key": codec_key,
+                "label": f"CPU software encoder ({software_name} {pretty_codec})",
+                "hardware": False,
+                "fallback_reason": fallback_reason,
+            }
+            _VIDEO_ENCODER_CACHE[cache_key] = dict(selected)
+            return selected
+
+        details = nvenc_failures + listing_errors
+        detail_text = "\n".join(details)
+        raise RuntimeError(
+            f"No usable {pretty_codec} encoder was found. FFmpeg needs a working "
+            f"NVIDIA {nvenc_name} encoder or the CPU {software_name} encoder."
+            + (f"\n\nEncoder diagnostics:\n{detail_text}" if detail_text else "")
+        )
+
+
+def select_hevc_encoder(force_refresh=False, quality_mode=False):
+    """Backward-compatible selector for the H.265/HEVC encoder."""
+    return select_video_encoder(
+        "H.265/HEVC", force_refresh=force_refresh, quality_mode=quality_mode
+    )
+
+
+def select_h264_encoder(force_refresh=False, quality_mode=False):
+    """Select the H.264/AVC NVENC encoder or its libx264 CPU fallback."""
+    return select_video_encoder(
+        "H.264", force_refresh=force_refresh, quality_mode=quality_mode
+    )
+
+
+def _hevc_quality_mode_maxrate_kbps(width=None, height=None, fps=None):
+    """Return the HEVC 1x1 Quality Mode ceiling, safely scaled for tiny frames."""
+    maxrate = int(VIDEO_HEVC_QUALITY_MODE_MAXRATE_KBPS)
+    if width is not None and height is not None and fps is not None:
+        width, height, fps = int(width), int(height), int(fps)
+        if width > 0 and height > 0 and fps > 0 and width * height < 640 * 360:
+            # Very small CPU x265 encodes can fail to initialize with an
+            # unnecessarily huge VBV. Keep at least 500 kbit/s, then scale
+            # the ceiling with pixel throughput up to the normal 200 Mbit/s.
+            safe_limit = max(500, int(width * height * fps / 1000))
+            maxrate = min(maxrate, safe_limit)
+    return maxrate
+
+
+def _video_encoder_arguments(
+    encoder_info, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS,
+    width=None, height=None, fps=None, quality_mode=False,
+):
+    """Build either fixed-200-Mbit/s or constant-QP high-detail encoder arguments.
+
+    Random 1x1 images contain independent high-frequency pixels in every frame.
+    Bitrate-constrained VBR can change quantization substantially between frames,
+    making some frames look darker or flatter. Constant-quality rate control
+    keeps visual quality consistent; its bitrate can vary with frame content.
+    H.264 NVENC uses VBR-CQ, while HEVC NVENC and CPU encoders use constant QP.
+    """
+    encoder = encoder_info["encoder"]
+    codec_key = encoder_info.get("codec_key")
+    if codec_key is None:
+        codec_key = "h264" if encoder in ("h264_nvenc", "libx264") else "hevc"
+    tag = "avc1" if codec_key == "h264" else "hvc1"
+    format_args = ["-pix_fmt", "yuv420p", "-tag:v", tag]
+
+    if quality_mode:
+        qp = str(VIDEO_QUALITY_MODE_QP)
+        if encoder == "h264_nvenc":
+            # Each 1x1 frame is independent random noise, so inter-frame
+            # prediction and adaptive quantization can introduce visible
+            # frame-to-frame contrast/brightness changes. Encode intra-only,
+            # with AQ and lookahead disabled, while retaining VBR-CQ to avoid
+            # the long-session constqp instability seen on some NVENC builds.
+            return [
+                "-c:v", encoder, "-preset", "p5", "-tune", "hq",
+                "-rc", "vbr", "-cq", qp, "-b:v", "0",
+                "-g", "0", "-bf", "0", "-rc-lookahead", "0",
+                "-spatial-aq", "0", "-temporal-aq", "0", *format_args,
+            ]
+        if encoder == "hevc_nvenc":
+            # Intra-only VBR-CQ prevents frame-to-frame temporal decisions and
+            # the 200 Mbit/s ceiling keeps 120 FPS HEVC files practical to play.
+            maxrate = VIDEO_HEVC_QUALITY_MODE_MAXRATE_KBPS
+            return [
+                "-c:v", encoder, "-preset", "p5", "-tune", "hq",
+                "-rc", "vbr", "-cq", str(VIDEO_HEVC_QUALITY_MODE_CQ),
+                "-b:v", f"{maxrate}k", "-maxrate", f"{maxrate}k",
+                "-bufsize", f"{maxrate * 2}k",
+                "-g", "0", "-bf", "0", "-rc-lookahead", "0",
+                "-spatial-aq", "0", "-temporal-aq", "0", *format_args,
+            ]
+        if encoder == "libx264":
+            # Match the H.264 NVENC random-noise path: one independently
+            # encoded I-frame per source frame, no B-frames or AQ.
+            return [
+                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0",
+                "-qp", qp, "-g", "1", "-bf", "0",
+                "-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:aq-mode=0",
+                *format_args,
+            ]
+        if encoder == "libx265":
+            # CPU fallback mirrors the HEVC NVENC quality strategy: all-I
+            # frames, no AQ/B-frames, CRF 20 with a 200 Mbit/s VBV ceiling.
+            maxrate = _hevc_quality_mode_maxrate_kbps(width, height, fps)
+            params = (
+                "log-level=error:pools=8:frame-threads=4:"
+                "keyint=1:min-keyint=1:scenecut=0:bframes=0:aq-mode=0:"
+                f"vbv-maxrate={maxrate}:vbv-bufsize={maxrate * 2}"
+            )
+            return [
+                "-c:v", "libx265", "-preset", "ultrafast", "-threads", "0",
+                "-crf", str(VIDEO_HEVC_QUALITY_MODE_CQ), "-g", "1", "-bf", "0",
+                "-x265-params", params, *format_args,
+            ]
+        raise ValueError(f"Unsupported video encoder: {encoder!r}")
+
+    bitrate_kbps = int(bitrate_kbps)
+    if bitrate_kbps <= 0:
+        raise ValueError("Video bitrate must be a positive number of kbit/s.")
+    # Tiny CPU HEVC outputs need a practical VBV ceiling to initialize reliably.
+    # At normal image sizes the requested fixed 200 Mbit/s target is unchanged.
+    if (
+        encoder == "libx265" and width is not None and height is not None
+        and fps is not None and int(width) * int(height) < 640 * 360
+    ):
+        safe_small_frame_limit = max(500, int(int(width) * int(height) * int(fps) / 1000))
+        bitrate_kbps = min(bitrate_kbps, safe_small_frame_limit)
+    common_rate = [
+        "-b:v", f"{bitrate_kbps}k",
+        "-maxrate", f"{bitrate_kbps}k",
+        "-bufsize", f"{bitrate_kbps * 2}k",
+        *format_args,
+    ]
+    if encoder in ("h264_nvenc", "hevc_nvenc"):
+        return [
+            "-c:v", encoder, "-preset", "p5", "-tune", "hq", "-rc", "vbr",
+            *common_rate,
+        ]
+    if encoder == "libx264":
+        return [
+            "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0",
+            *common_rate,
+        ]
+    if encoder == "libx265":
+        return [
+            "-c:v", "libx265", "-preset", "ultrafast", "-threads", "0",
+            "-x265-params", "log-level=error:pools=8:frame-threads=4",
+            *common_rate,
+        ]
+    raise ValueError(f"Unsupported video encoder: {encoder!r}")
+
+
+def _hevc_encoder_arguments(encoder_info, bitrate_kbps, width=None, height=None, fps=None):
+    """Backward-compatible wrapper for HEVC encoder argument creation."""
+    return _video_encoder_arguments(encoder_info, bitrate_kbps, width, height, fps)
+
+
+def encode_random_h264_video(
+    output_path,
+    width,
+    height,
+    depth,
+    duration_seconds=VIDEO_DEFAULT_SECONDS,
+    fps=VIDEO_DEFAULT_FPS,
+    bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS,
+    pixel_size=1,
+    progress_callback=None,
+    bilinear=False,
+    rotation_degrees=0,
+    rotation_direction="Clockwise",
+    compute_backend="CPU",
+    video_codec=VIDEO_DEFAULT_CODEC,
+    cancel_control=None,
+):
+    """Create an H.264 or H.265 MP4 with fresh random frames and optional OpenCL rotation."""
+    width, height, depth = int(width), int(height), int(depth)
     duration_seconds = int(duration_seconds)
     fps = int(fps)
     if not VIDEO_MIN_SECONDS <= duration_seconds <= VIDEO_MAX_SECONDS:
@@ -2215,102 +3349,402 @@ def encode_random_h264_video(output_path, width, height, depth, duration_seconds
     pixel_size = int(pixel_size)
     if not 1 <= pixel_size <= 32:
         raise ValueError("Pixel size must be between 1x1 and 32x32.")
-    depth = int(depth)
+    quality_mode = pixel_size == 1
     if not 1 <= depth <= 24:
         raise ValueError("Color depth must be between 1 and 24 bits.")
+    if width <= 0 or height <= 0 or width * height > VIDEO_MAX_PIXELS:
+        raise ValueError("Video dimensions must be positive and within the 4K pixel limit.")
+    if not 0 <= float(rotation_degrees) <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if str(rotation_direction) not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+
+    requested_backend = str(compute_backend).strip().capitalize()
+    if requested_backend not in ("Automatic", "Cpu", "Gpu"):
+        raise ValueError("Video renderer must be Automatic, CPU or GPU.")
+    renderer = None
+    selected_backend = "CPU"
+    gpu_fallback_reason = None
+    if requested_backend in ("Automatic", "Gpu"):
+        try:
+            renderer = get_opencl_renderer()
+            renderer._ensure_video_kernels()
+            selected_backend = "GPU"
+        except Exception as exc:
+            if requested_backend == "Gpu":
+                raise RuntimeError(f"GPU video export was selected, but OpenCL is unavailable: {exc}") from exc
+            gpu_fallback_reason = str(exc)
+
     total_frames = fps * duration_seconds
-
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-
-    # Confirm that the bundled FFmpeg build includes the requested H.264 encoder.
-    encoder_check = subprocess.run(
-        [ffmpeg_exe, "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-        **hidden_subprocess_options(),
-    )
-    if encoder_check.returncode != 0 or "libx264" not in encoder_check.stdout:
-        raise RuntimeError(
-            "The bundled FFmpeg does not provide the libx264 H.264 encoder."
+    if selected_backend == "GPU":
+        # Keep the palette fixed for the whole clip, just like the CPU exporter.
+        palette = np.asarray(
+            make_random_palette(depth) if depth <= 8 else [(0, 0, 0), (255, 255, 255)],
+            dtype=np.uint8,
+        )
+        frame_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+        filter_text = _ffmpeg_video_output_filter()
+    else:
+        palette = (
+            np.asarray(make_random_palette(depth), dtype=np.uint8)
+            if depth <= 8 else None
+        )
+        rng = np.random.default_rng()
+        frame_seed = None
+        # Random pixel art must retain its discrete source colors during
+        # rotation. Bilinear rotation blends neighboring random pixels and
+        # makes subsequent frames look washed out compared with frame 1.
+        filter_text = build_ffmpeg_rotation_filter(
+            rotation_degrees, rotation_direction, total_frames, fps,
+            bilinear=False,
         )
 
-    palette = (
-        np.asarray(make_random_palette(depth), dtype=np.uint8)
-        if depth <= 8 else None
-    )
-    rng = np.random.default_rng()
+    if cancel_control is not None:
+        cancel_control.check()
 
-    # yuv420p is broadly compatible with common video players.
-    # The pad filter adds one black pixel on the right/bottom for odd dimensions.
+    # Quality mode must be probed with its exact rate-control mode before export.
+    encoder_info = select_video_encoder(video_codec, quality_mode=quality_mode)
+    ffmpeg_exe = encoder_info["ffmpeg"]
     command = [
-        ffmpeg_exe,
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-f", "rawvideo",
-        "-pixel_format", "rgb24",
-        "-video_size", f"{width}x{height}",
-        "-framerate", str(fps),
-        "-i", "pipe:0",
-        "-an",
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "pipe:0", "-an",
+        "-filter_threads", str(_ffmpeg_thread_count()), "-vf", filter_text,
         "-frames:v", str(total_frames),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-b:v", f"{bitrate_kbps}k",
-        "-maxrate", f"{bitrate_kbps}k",
-        "-bufsize", f"{bitrate_kbps * 2}k",
-        "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        "-movflags", "+faststart",
-        output_path,
+        *_video_encoder_arguments(
+            encoder_info, bitrate_kbps, width, height, fps, quality_mode=quality_mode
+        ),
+        "-r", str(fps), "-movflags", "+faststart", output_path,
     ]
-
     process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        bufsize=0,
+        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, bufsize=0, text=False,
         **hidden_subprocess_options(),
     )
-
+    if cancel_control is not None:
+        cancel_control.attach_process(process)
     try:
-        # Generate one fresh random pattern for every output frame.
-        # pattern for every output frame at the selected frame rate.
-        for output_frame_number in range(1, total_frames + 1):
-            frame_bytes = generate_pixelated_frame(
-                width,
-                height,
-                depth,
-                pixel_size=pixel_size,
-                rng=rng,
-                palette=palette,
-                bilinear=bilinear,
-            ).tobytes()
-            process.stdin.write(frame_bytes)
-
-            if progress_callback and (
-                output_frame_number % 5 == 0
-                or output_frame_number == total_frames
-            ):
-                progress_callback(output_frame_number)
+        if selected_backend == "GPU":
+            batch_size = _opencl_video_batch_size(width, height)
+            for first_frame in range(0, total_frames, batch_size):
+                if cancel_control is not None:
+                    cancel_control.check()
+                batch_count = min(batch_size, total_frames - first_frame)
+                frames = renderer.render_random_video_batch(
+                    width, height, depth, pixel_size, bool(bilinear), palette,
+                    frame_seed, first_frame, total_frames, float(rotation_degrees),
+                    rotation_direction, batch_count,
+                )
+                if cancel_control is not None:
+                    cancel_control.check()
+                process.stdin.write(frames.tobytes())
+                if progress_callback:
+                    progress_callback(first_frame + batch_count)
+        else:
+            for frame_number in range(1, total_frames + 1):
+                if cancel_control is not None:
+                    cancel_control.check()
+                frame_bytes = generate_pixelated_frame(
+                    width, height, depth, pixel_size=pixel_size,
+                    rng=rng, palette=palette, bilinear=bilinear,
+                ).tobytes()
+                if cancel_control is not None:
+                    cancel_control.check()
+                process.stdin.write(frame_bytes)
+                if progress_callback and (
+                    frame_number % 5 == 0 or frame_number == total_frames
+                ):
+                    progress_callback(frame_number)
 
         process.stdin.close()
         error_text = process.stderr.read().decode("utf-8", errors="replace")
+        process.stderr.close()
         return_code = process.wait()
-
         if return_code != 0:
             raise RuntimeError(
                 "FFmpeg failed to encode the video."
                 + (f"\n\nFFmpeg details:\n{error_text}" if error_text else "")
             )
-
+        if cancel_control is not None:
+            cancel_control.check()
+            cancel_control.detach_process(process)
         if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
             raise RuntimeError("FFmpeg finished, but no MP4 file was created.")
+        return {
+            "frames": total_frames, "backend": selected_backend,
+            "device": opencl_device_label(renderer.device) if renderer else None,
+            "fallback_reason": gpu_fallback_reason,
+            "encoder": encoder_info["encoder"],
+            "encoder_label": encoder_info["label"],
+            "encoder_fallback_reason": encoder_info["fallback_reason"],
+            "codec": encoder_info["codec"],
+            "quality_mode": quality_mode,
+            "rate_control": (
+                (
+                    f"NVENC VBR-CQ {VIDEO_QUALITY_MODE_QP} (intra-only)"
+                    if encoder_info["encoder"] == "h264_nvenc" else
+                    f"NVENC VBR-CQ {VIDEO_HEVC_QUALITY_MODE_CQ}, max {VIDEO_HEVC_QUALITY_MODE_MAXRATE_KBPS // 1000} Mbit/s (intra-only)"
+                    if encoder_info["encoder"] == "hevc_nvenc" else
+                    f"CPU CRF {VIDEO_HEVC_QUALITY_MODE_CQ}, max {_hevc_quality_mode_maxrate_kbps(width, height, fps) / 1000:g} Mbit/s (intra-only)"
+                    if encoder_info["encoder"] == "libx265" else
+                    f"Constant QP {VIDEO_QUALITY_MODE_QP}"
+                ) if quality_mode else
+                f"Fixed target {bitrate_kbps // 1000} Mbit/s"
+            ),
+        }
+    except Exception as exc:
+        # FFmpeg may reject an encoder/rate-control combination and exit before
+        # the frame writer finishes. Preserve stderr so the user sees the real
+        # cause instead of the unhelpful Windows [Errno 32] Broken pipe message.
+        broken_pipe = isinstance(exc, BrokenPipeError) or (
+            isinstance(exc, OSError) and getattr(exc, "errno", None) == 32
+        )
+        ffmpeg_return_code = process.poll()
+        ffmpeg_error_text = ""
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        if broken_pipe:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            ffmpeg_return_code = process.poll()
+            try:
+                if process.stderr and not process.stderr.closed:
+                    ffmpeg_error_text = process.stderr.read().decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+            except Exception:
+                pass
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            try:
+                if stream and not stream.closed:
+                    stream.close()
+            except Exception:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        _remove_incomplete_video_file(output_path)
+        if cancel_control is not None:
+            cancel_control.detach_process(process)
+            if cancel_control.cancelled:
+                raise VideoExportCancelled("Video export cancelled. Incomplete output removed.") from exc
+        if broken_pipe:
+            detail = ffmpeg_error_text or "FFmpeg exited without returning diagnostic text."
+            raise RuntimeError(
+                "FFmpeg stopped accepting video frames before export completed "
+                f"(exit code {ffmpeg_return_code}).\n\nFFmpeg details:\n{detail}"
+            ) from exc
+        raise
 
+
+
+def progressive_rotation_angle(frame_index, total_frames, rotation_degrees, direction):
+    """Return the per-frame angle for a smooth 0-to-target video rotation."""
+    total_frames = int(total_frames)
+    frame_index = int(frame_index)
+    rotation_degrees = float(rotation_degrees)
+    direction = str(direction)
+    if total_frames < 1:
+        raise ValueError("A video must contain at least one frame.")
+    if not 0.0 <= rotation_degrees <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if direction not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+    progress = frame_index / max(1, total_frames - 1)
+    sign = -1.0 if direction == "Clockwise" else 1.0
+    # Pillow uses positive angles for counterclockwise rotation.
+    return sign * rotation_degrees * min(1.0, max(0.0, progress))
+
+
+def rotate_video_frame(image, frame_index, total_frames, rotation_degrees=0, direction="Clockwise"):
+    """Rotate a frame smoothly around its center without changing output size."""
+    angle = progressive_rotation_angle(
+        frame_index, total_frames, rotation_degrees, direction
+    )
+    if abs(angle) < 1e-12:
+        return image
+    return image.rotate(
+        angle,
+        resample=Image.Resampling.BICUBIC,
+        expand=False,
+        fillcolor=(0, 0, 0),
+    )
+
+
+
+def build_ffmpeg_rotation_filter(
+    rotation_degrees, direction, total_frames, fps, bilinear=True
+):
+    """Build a progressive FFmpeg rotation filter for the full video stream.
+
+    Bilinear interpolation is the smooth default for fractal imagery. Random
+    pixel exports pass bilinear=False to preserve crisp source colors.
+    """
+    rotation_degrees = float(rotation_degrees)
+    direction = str(direction)
+    total_frames = int(total_frames)
+    fps = int(fps)
+    if not 0.0 <= rotation_degrees <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if direction not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+    if total_frames < 1 or fps < 1:
+        raise ValueError("Frame count and frame rate must be positive.")
+
+    filters = []
+    if rotation_degrees > 0.0 and total_frames > 1:
+        # FFmpeg's rotate filter uses image coordinates (positive Y points down),
+        # so a positive angle is visually clockwise. This is the opposite sign
+        # convention from Pillow's Image.rotate(), used by rotate_video_frame().
+        sign = 1.0 if direction == "Clockwise" else -1.0
+        final_radians = math.radians(rotation_degrees) * sign
+        # FFmpeg's t is seconds; scale it so the final frame reaches the exact
+        # selected angle (frame index / (total_frames - 1)).
+        angle_expr = f"({final_radians:.15g})*t*{fps}/{total_frames - 1}"
+        filters.append(
+            "rotate=angle='" + angle_expr + "':ow=iw:oh=ih:"
+            "fillcolor=black:bilinear=" + ("1" if bilinear else "0")
+        )
+    filters.extend((
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "format=yuv420p",
+    ))
+    return ",".join(filters)
+
+
+def _ffmpeg_thread_count():
+    """Return the logical CPU count for FFmpeg's threaded filters/encoder."""
+    return max(1, int(os.cpu_count() or 1))
+
+def encode_rotating_image_h264_video(
+    output_path,
+    source_image,
+    duration_seconds=VIDEO_DEFAULT_SECONDS,
+    fps=VIDEO_DEFAULT_FPS,
+    bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS,
+    rotation_degrees=0,
+    rotation_direction="Clockwise",
+    progress_callback=None,
+    compute_backend="CPU",
+    video_codec=VIDEO_DEFAULT_CODEC,
+    cancel_control=None,
+):
+    """Export a still image as a rotating H.264 or H.265 MP4."""
+    duration_seconds, fps = int(duration_seconds), int(fps)
+    if not VIDEO_MIN_SECONDS <= duration_seconds <= VIDEO_MAX_SECONDS:
+        raise ValueError("Video duration must be between 1 and 60 seconds.")
+    if fps not in VIDEO_FPS_OPTIONS:
+        raise ValueError("Frame rate must be 30, 60 or 120 FPS.")
+    if not 0 <= float(rotation_degrees) <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if str(rotation_direction) not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+    image = source_image.convert("RGB")
+    width, height = image.size
+    if width * height > VIDEO_MAX_PIXELS:
+        raise ValueError("H.265 video export is limited to 8,294,400 pixels per frame.")
+
+    requested_backend = str(compute_backend).strip().capitalize()
+    if requested_backend not in ("Automatic", "Cpu", "Gpu"):
+        raise ValueError("Video renderer must be Automatic, CPU or GPU.")
+    renderer = None
+    selected_backend = "CPU"
+    gpu_fallback_reason = None
+    if requested_backend in ("Automatic", "Gpu"):
+        try:
+            renderer = get_opencl_renderer()
+            renderer._ensure_video_kernels()
+            selected_backend = "GPU"
+        except Exception as exc:
+            if requested_backend == "Gpu":
+                raise RuntimeError(f"GPU rotation was selected, but OpenCL is unavailable: {exc}") from exc
+            gpu_fallback_reason = str(exc)
+
+    total_frames = duration_seconds * fps
+    if cancel_control is not None:
+        cancel_control.check()
+    encoder_info = select_video_encoder(video_codec)
+    if selected_backend == "CPU":
+        result = _encode_rotating_still_with_ffmpeg(
+            output_path, image, duration_seconds, fps, bitrate_kbps,
+            rotation_degrees, rotation_direction, progress_callback,
+            encoder_info=encoder_info, video_codec=video_codec,
+            cancel_control=cancel_control,
+        )
+        result["fallback_reason"] = gpu_fallback_reason
+        result["encoder_fallback_reason"] = encoder_info["fallback_reason"]
+        return result
+
+    ffmpeg_exe = encoder_info["ffmpeg"]
+    command = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "pipe:0", "-an", "-filter_threads", str(_ffmpeg_thread_count()),
+        "-vf", _ffmpeg_video_output_filter(), "-frames:v", str(total_frames),
+        *_video_encoder_arguments(encoder_info, bitrate_kbps, width, height, fps),
+        "-r", str(fps), "-movflags", "+faststart", output_path,
+    ]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, bufsize=0, **hidden_subprocess_options(),
+    )
+    if cancel_control is not None:
+        cancel_control.attach_process(process)
+    try:
+        source = np.asarray(image, dtype=np.uint8)
+        batch_size = _opencl_video_batch_size(width, height)
+        for first_frame in range(0, total_frames, batch_size):
+            if cancel_control is not None:
+                cancel_control.check()
+            batch_count = min(batch_size, total_frames - first_frame)
+            batch = np.repeat(source[np.newaxis, ...], batch_count, axis=0)
+            rotated = renderer.rotate_rgb_batch(
+                batch, first_frame, total_frames,
+                float(rotation_degrees), rotation_direction,
+            )
+            if cancel_control is not None:
+                cancel_control.check()
+            process.stdin.write(rotated.tobytes())
+            if progress_callback:
+                progress_callback(first_frame + batch_count)
+        process.stdin.close()
+        error_text = process.stderr.read().decode("utf-8", errors="replace")
+        process.stderr.close()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError("FFmpeg failed to encode the video." + (f"\n\nFFmpeg details:\n{error_text}" if error_text else ""))
+        if cancel_control is not None:
+            cancel_control.check()
+            cancel_control.detach_process(process)
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("FFmpeg finished, but no MP4 file was created.")
+        if progress_callback:
+            progress_callback(total_frames)
+        return {
+            "frames": total_frames, "width": width, "height": height,
+            "backend": selected_backend, "device": opencl_device_label(renderer.device),
+            "encoder": encoder_info["encoder"], "encoder_label": encoder_info["label"],
+            "encoder_fallback_reason": encoder_info["fallback_reason"],
+            "codec": encoder_info["codec"],
+        }
     except Exception:
         try:
             if process.stdin and not process.stdin.closed:
@@ -2324,14 +3758,265 @@ def encode_random_h264_video(output_path, width, height, depth, duration_seconds
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        try:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-        except OSError:
-            pass
+        _remove_incomplete_video_file(output_path)
+        if cancel_control is not None:
+            cancel_control.detach_process(process)
+            if cancel_control.cancelled:
+                raise VideoExportCancelled("Video export cancelled. Incomplete output removed.")
         raise
 
 
+def _encode_rotating_still_with_ffmpeg(
+    output_path, image, duration_seconds, fps, bitrate_kbps,
+    rotation_degrees, rotation_direction, progress_callback=None,
+    encoder_info=None, video_codec=VIDEO_DEFAULT_CODEC, cancel_control=None,
+):
+    """Loop a still RGB image inside FFmpeg, rotate it and encode the chosen codec."""
+    width, height = image.size
+    total_frames = int(duration_seconds) * int(fps)
+    if cancel_control is not None:
+        cancel_control.check()
+    encoder_info = encoder_info or select_video_encoder(video_codec)
+    ffmpeg_exe = encoder_info["ffmpeg"]
+    video_filter = build_ffmpeg_rotation_filter(
+        rotation_degrees, rotation_direction, total_frames, fps
+    )
+    with tempfile.TemporaryDirectory(prefix="pixel_generator_hevc_") as temp_dir:
+        still_path = os.path.join(temp_dir, "source_frame.png")
+        image.save(still_path, format="PNG", optimize=False)
+        command = [
+            ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+            "-filter_threads", str(_ffmpeg_thread_count()),
+            "-loop", "1", "-framerate", str(fps), "-i", still_path,
+            "-an", "-vf", video_filter, "-frames:v", str(total_frames),
+            *_video_encoder_arguments(encoder_info, bitrate_kbps, width, height, fps),
+            "-r", str(fps), "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", output_path,
+        ]
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+            **hidden_subprocess_options(),
+        )
+        if cancel_control is not None:
+            cancel_control.attach_process(process)
+        try:
+            for line in process.stdout:
+                key, separator, value = line.strip().partition("=")
+                if separator and key == "frame" and progress_callback:
+                    try:
+                        progress_callback(min(total_frames, int(value)))
+                    except ValueError:
+                        pass
+            error_text = process.stderr.read()
+            process.stdout.close()
+            process.stderr.close()
+            return_code = process.wait()
+            if cancel_control is not None:
+                cancel_control.check()
+                cancel_control.detach_process(process)
+            if return_code != 0:
+                raise RuntimeError("FFmpeg failed to encode the video." + (f"\n\nFFmpeg details:\n{error_text}" if error_text else ""))
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("FFmpeg finished, but no MP4 file was created.")
+            if progress_callback:
+                progress_callback(total_frames)
+            return {
+                "frames": total_frames, "width": width, "height": height,
+                "backend": "CPU", "encoder": encoder_info["encoder"],
+                "encoder_label": encoder_info["label"],
+                "encoder_fallback_reason": encoder_info["fallback_reason"],
+                "codec": encoder_info["codec"],
+            }
+        except Exception:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            _remove_incomplete_video_file(output_path)
+            if cancel_control is not None:
+                cancel_control.detach_process(process)
+                if cancel_control.cancelled:
+                    raise VideoExportCancelled("Video export cancelled. Incomplete output cleanup attempted.")
+            raise
+
+
+def resolve_fractal_render_backend(width, height, fractal_type, rendering_mode):
+    """Resolve one backend once for long-running batch/animation jobs."""
+    mode = str(rendering_mode)
+    if mode == "Automatic":
+        info = auto_select_fractal_backend(width, height, fractal_type)
+        return info["backend"], info.get("renderer"), info
+    if mode == "GPU":
+        renderer = get_opencl_renderer()
+        return "GPU", renderer, {
+            "backend": "GPU", "renderer": renderer, "device": renderer.device,
+            "cpu_threads": None, "reason": "GPU rendering selected manually.",
+        }
+    if mode == "CPU":
+        thread_info = auto_optimize_numba_threads()
+        return "CPU", None, {
+            "backend": "CPU", "renderer": None, "device": None,
+            "cpu_threads": int(thread_info["selected_threads"]),
+            "thread_info": thread_info, "reason": "CPU rendering selected manually.",
+        }
+    raise ValueError(f"Unsupported rendering mode: {mode!r}")
+
+
+def encode_fractal_zoom_animation(
+    output_path,
+    width,
+    height,
+    depth,
+    fractal_type,
+    start_view_state,
+    duration_seconds=ANIMATION_DEFAULT_SECONDS,
+    fps=ANIMATION_DEFAULT_FPS,
+    zoom_factor=25.0,
+    target_x=0.5,
+    target_y=0.5,
+    pixel_size=1,
+    bilinear=False,
+    rendering_mode=DEFAULT_RENDERING_MODE,
+    progress_callback=None,
+    bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS,
+    rotation_degrees=0,
+    rotation_direction="Clockwise",
+    video_codec=VIDEO_DEFAULT_CODEC,
+    cancel_control=None,
+):
+    """Render an H.264 or H.265 zoom journey through the current fractal viewport."""
+    width, height, depth = int(width), int(height), int(depth)
+    duration_seconds, fps = int(duration_seconds), int(fps)
+    if not VIDEO_MIN_SECONDS <= duration_seconds <= VIDEO_MAX_SECONDS:
+        raise ValueError("Animation duration must be between 1 and 60 seconds.")
+    if fps not in VIDEO_FPS_OPTIONS:
+        raise ValueError("Animation frame rate must be 30, 60 or 120 FPS.")
+    if width * height > VIDEO_MAX_PIXELS:
+        raise ValueError("Fractal animation video is limited to 8,294,400 pixels per frame (4K).")
+    if not isinstance(start_view_state, dict):
+        raise ValueError("Generate or load a fractal before creating an animation.")
+    if not 1.0 < float(zoom_factor) <= 10000.0:
+        raise ValueError("Zoom factor must be greater than 1 and no more than 10,000.")
+    if not 1 <= int(pixel_size) <= 32:
+        raise ValueError("Pixel size must be between 1x1 and 32x32.")
+    if not 0 <= float(rotation_degrees) <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if str(rotation_direction) not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+    if cancel_control is not None:
+        cancel_control.check()
+
+    backend, renderer, render_info = resolve_fractal_render_backend(
+        width, height, fractal_type, rendering_mode
+    )
+    if backend == "GPU":
+        try:
+            renderer._ensure_video_kernels()
+        except Exception:
+            if str(rendering_mode) != "Automatic":
+                raise
+            backend, renderer, render_info = resolve_fractal_render_backend(
+                width, height, fractal_type, "CPU"
+            )
+    start_state = dict(start_view_state)
+    end_state = zoom_fractal_view(
+        start_state, float(target_x), float(target_y), float(zoom_factor), width, height
+    )
+    total_frames = duration_seconds * fps
+    if cancel_control is not None:
+        cancel_control.check()
+    encoder_info = select_video_encoder(video_codec)
+    ffmpeg_exe = encoder_info["ffmpeg"]
+
+    gpu_rotation = backend == "GPU"
+    video_filter = (
+        _ffmpeg_video_output_filter() if gpu_rotation else
+        build_ffmpeg_rotation_filter(rotation_degrees, rotation_direction, total_frames, fps)
+    )
+    command = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-filter_threads", str(_ffmpeg_thread_count()),
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "pipe:0", "-an", "-vf", video_filter,
+        "-frames:v", str(total_frames),
+        *_video_encoder_arguments(encoder_info, bitrate_kbps, width, height, fps),
+        "-r", str(fps), "-movflags", "+faststart", output_path,
+    ]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, bufsize=0, **hidden_subprocess_options(),
+    )
+    if cancel_control is not None:
+        cancel_control.attach_process(process)
+    try:
+        for frame_number in range(total_frames):
+            if cancel_control is not None:
+                cancel_control.check()
+            progress = frame_number / max(1, total_frames - 1)
+            frame_state = interpolate_fractal_view_states(start_state, end_state, progress)
+            image, _count = generate_fractal_image(
+                width, height, depth, fractal_type=fractal_type,
+                compute_backend=backend, opencl_renderer=renderer,
+                view_state=frame_state,
+            )
+            frame = pixelate_image(image, pixel_size, bilinear=bilinear).convert("RGB")
+            if gpu_rotation:
+                rotated = renderer.rotate_rgb_batch(
+                    np.asarray(frame, dtype=np.uint8)[np.newaxis, ...],
+                    frame_number, total_frames, rotation_degrees, rotation_direction,
+                )[0]
+                if cancel_control is not None:
+                    cancel_control.check()
+                process.stdin.write(rotated.tobytes())
+            else:
+                # FFmpeg performs rotation in its threaded filter graph on the CPU path.
+                if cancel_control is not None:
+                    cancel_control.check()
+                process.stdin.write(frame.tobytes())
+            if progress_callback and ((frame_number + 1) % 2 == 0 or frame_number + 1 == total_frames):
+                progress_callback(frame_number + 1)
+        process.stdin.close()
+        error_text = process.stderr.read().decode("utf-8", errors="replace")
+        process.stderr.close()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError("FFmpeg failed to encode the fractal animation." + (f"\n\nFFmpeg details:\n{error_text}" if error_text else ""))
+        if cancel_control is not None:
+            cancel_control.check()
+            cancel_control.detach_process(process)
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("FFmpeg finished, but no animation MP4 was created.")
+        return {
+            "backend": backend, "device": render_info.get("device"),
+            "frames": total_frames, "encoder": encoder_info["encoder"],
+            "encoder_label": encoder_info["label"],
+            "encoder_fallback_reason": encoder_info["fallback_reason"],
+            "codec": encoder_info["codec"],
+        }
+    except Exception:
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        _remove_incomplete_video_file(output_path)
+        if cancel_control is not None:
+            cancel_control.detach_process(process)
+            if cancel_control.cancelled:
+                raise VideoExportCancelled("Fractal animation cancelled. Incomplete output removed.")
+        raise
 
 def format_gif_resolution(resolution):
     """Format a GIF resolution tuple for the selector and status text."""
@@ -2559,8 +4244,205 @@ def encode_random_gif(
         raise
 
 
+
+def encode_fractal_zoom_animation_gif(
+    output_path,
+    width,
+    height,
+    depth,
+    fractal_type,
+    start_view_state,
+    duration_seconds=GIF_DEFAULT_SECONDS,
+    zoom_factor=25.0,
+    target_x=0.5,
+    target_y=0.5,
+    pixel_size=1,
+    bilinear=False,
+    rendering_mode=DEFAULT_RENDERING_MODE,
+    progress_callback=None,
+    rotation_degrees=0,
+    rotation_direction="Clockwise",
+    resolution=GIF_DEFAULT_RESOLUTION,
+    cancel_control=None,
+):
+    """Render a 30-FPS fractal zoom/rotation journey as an animated GIF.
+
+    The GIF resolution must be one of the same 13 presets offered by the main
+    random-pixel GIF exporter. A small set of representative animation frames
+    builds one shared global palette; the complete animation is then rendered
+    and quantized against that palette so colors remain stable throughout.
+    """
+    width, height, depth = int(width), int(height), int(depth)
+    duration_seconds = int(duration_seconds)
+    gif_width, gif_height = normalize_gif_resolution(resolution)
+    pixel_size = int(pixel_size)
+
+    if not GIF_MIN_SECONDS <= duration_seconds <= GIF_MAX_SECONDS:
+        raise ValueError(
+            f"GIF duration must be between {GIF_MIN_SECONDS} and {GIF_MAX_SECONDS} seconds."
+        )
+    if not 1 <= depth <= 24:
+        raise ValueError("Fractal color depth must be between 1 and 24 bits.")
+    if not 1 <= pixel_size <= 32:
+        raise ValueError("Pixel size must be between 1x1 and 32x32.")
+    if not isinstance(start_view_state, dict):
+        raise ValueError("Generate or load a fractal before exporting an animated GIF.")
+    if not 1.0 < float(zoom_factor) <= 10000.0:
+        raise ValueError("Zoom factor must be greater than 1 and no more than 10,000.")
+    if not (0.0 <= float(target_x) <= 1.0 and 0.0 <= float(target_y) <= 1.0):
+        raise ValueError("GIF zoom target coordinates must be between 0 and 1.")
+    if not 0 <= float(rotation_degrees) <= VIDEO_MAX_ROTATION_DEGREES:
+        raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+    if str(rotation_direction) not in ("Clockwise", "Counterclockwise"):
+        raise ValueError("Rotation direction must be Clockwise or Counterclockwise.")
+    if cancel_control is not None:
+        cancel_control.check()
+
+    backend, renderer, render_info = resolve_fractal_render_backend(
+        gif_width, gif_height, fractal_type, rendering_mode
+    )
+    start_state = dict(start_view_state)
+    end_state = zoom_fractal_view(
+        start_state, float(target_x), float(target_y), float(zoom_factor),
+        gif_width, gif_height,
+    )
+    total_frames = duration_seconds * GIF_FPS
+    total_duration_ms = duration_seconds * 1000
+
+    def render_frame(frame_index, render_width, render_height, render_pixel_size):
+        if cancel_control is not None:
+            cancel_control.check()
+        progress = frame_index / max(1, total_frames - 1)
+        frame_state = interpolate_fractal_view_states(
+            start_state, end_state, progress
+        )
+        image, _color_count = generate_fractal_image(
+            render_width,
+            render_height,
+            depth,
+            fractal_type=fractal_type,
+            compute_backend=backend,
+            opencl_renderer=renderer,
+            view_state=frame_state,
+        )
+        if cancel_control is not None:
+            cancel_control.check()
+        frame = pixelate_image(
+            image, render_pixel_size, bilinear=bilinear
+        ).convert("RGB")
+        frame = rotate_video_frame(
+            frame,
+            frame_index,
+            total_frames,
+            rotation_degrees=rotation_degrees,
+            direction=rotation_direction,
+        )
+        return frame
+
+    # Build a representative palette from evenly spaced moments in the zoom.
+    # The sample render is capped at 160x120 to keep palette preparation cheap,
+    # while retaining the selected GIF aspect ratio and approximate pixel size.
+    sample_scale = min(1.0, 160.0 / gif_width, 120.0 / gif_height)
+    sample_width = max(1, int(round(gif_width * sample_scale)))
+    sample_height = max(1, int(round(gif_height * sample_scale)))
+    sample_pixel_size = max(1, int(round(pixel_size * sample_scale)))
+    sample_count = min(8, total_frames)
+    if sample_count == 1:
+        sample_indices = [0]
+    else:
+        sample_indices = sorted({
+            int(round(index * (total_frames - 1) / (sample_count - 1)))
+            for index in range(sample_count)
+        })
+
+    palette_samples = Image.new(
+        "RGB", (sample_width, sample_height * len(sample_indices))
+    )
+    frames = []
+    try:
+        for sample_number, frame_index in enumerate(sample_indices):
+            if cancel_control is not None:
+                cancel_control.check()
+            sample_frame = render_frame(
+                frame_index, sample_width, sample_height, sample_pixel_size
+            )
+            palette_samples.paste(
+                sample_frame, (0, sample_number * sample_height)
+            )
+
+        shared_palette = palette_samples.quantize(
+            colors=256,
+            method=Image.Quantize.MEDIANCUT,
+            dither=Image.Dither.NONE,
+        )
+        del palette_samples
+
+        for frame_index in range(total_frames):
+            if cancel_control is not None:
+                cancel_control.check()
+            rgb_frame = render_frame(
+                frame_index, gif_width, gif_height, pixel_size
+            )
+            indexed_frame = rgb_frame.quantize(
+                palette=shared_palette,
+                dither=Image.Dither.NONE,
+            )
+            frames.append(indexed_frame)
+            if progress_callback:
+                progress_callback(frame_index + 1)
+
+        if cancel_control is not None:
+            cancel_control.check()
+        durations = gif_frame_durations_ms(total_frames, total_duration_ms)
+        _write_gif_frames_preserving_duplicates(output_path, frames, durations)
+        if cancel_control is not None:
+            cancel_control.check()
+
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("Fractal GIF encoding finished, but no file was created.")
+        with Image.open(output_path) as check:
+            if check.format != "GIF":
+                raise RuntimeError("Fractal animation output is not a valid GIF file.")
+            if check.size != (gif_width, gif_height):
+                raise RuntimeError(
+                    f"GIF encoder produced {check.size}; expected {(gif_width, gif_height)}."
+                )
+            if getattr(check, "n_frames", 1) != total_frames:
+                raise RuntimeError(
+                    f"GIF encoder produced {getattr(check, 'n_frames', 1)} frames; "
+                    f"expected {total_frames}."
+                )
+            actual_duration = 0
+            for frame_index in range(check.n_frames):
+                check.seek(frame_index)
+                actual_duration += int(check.info.get("duration", 0))
+            if actual_duration != total_duration_ms:
+                raise RuntimeError(
+                    f"GIF duration mismatch: expected {total_duration_ms} ms, "
+                    f"got {actual_duration} ms."
+                )
+
+        return {
+            "format": "GIF",
+            "backend": backend,
+            "device": render_info.get("device"),
+            "frames": total_frames,
+            "width": gif_width,
+            "height": gif_height,
+            "duration_seconds": duration_seconds,
+            "fps": GIF_FPS,
+        }
+    except Exception:
+        _remove_incomplete_video_file(output_path)
+        if cancel_control is not None and cancel_control.cancelled:
+            raise VideoExportCancelled(
+                "Fractal GIF export cancelled. Incomplete GIF removed."
+            )
+        raise
+
+
 class RandomPixelGenerator:
-    """Random-pixel image, fractal, H.264 video and GIF generator."""
+    """Random-pixel image, fractal, H.265 video and GIF generator."""
 
     def __init__(self, root):
         self.root = root
@@ -2574,6 +4456,27 @@ class RandomPixelGenerator:
         self.rendering_mode_var = tk.StringVar(
             value=load_rendering_mode_preference(self.rendering_mode_preference_path)
         )
+        self.bookmarks_path = get_fractal_bookmarks_path()
+        self.bookmarks = load_fractal_bookmarks(self.bookmarks_path)
+        self.custom_palettes_path = get_custom_palettes_path()
+        self.custom_palettes = load_custom_palettes(self.custom_palettes_path)
+        self.active_palette_name = load_active_palette()
+        self.active_palette_stops = self.custom_palettes.get(self.active_palette_name)
+        if self.active_palette_name != "Random" and self.active_palette_stops is None:
+            self.active_palette_name = "Random"
+            save_active_palette("Random")
+        self.gallery_auto_save_var = tk.BooleanVar(value=load_gallery_auto_save())
+        self.fractal_history = []
+        self.fractal_history_index = -1
+        self.is_batch_generating = False
+        self.is_exporting_animation = False
+        self.active_video_export_control = None
+        self.batch_cancel_event = threading.Event()
+        self.batch_queue = queue.Queue()
+        self.animation_queue = queue.Queue()
+        self.batch_window = None
+        self.batch_progress = None
+        self.batch_status_label = None
         if ttkbootstrap is None:
             raise RuntimeError(
                 "The theme engine is not installed. Run build_windows.bat or install "
@@ -2603,6 +4506,8 @@ class RandomPixelGenerator:
         self.current_render_seconds = None
         self.current_backend_setup_seconds = None
         self.current_render_reason = None
+        # Disable navigation actions until the first fractal has been generated.
+        self._update_navigation_menu_state()
 
         self.result_queue = queue.Queue()
         self.video_queue = queue.Queue()
@@ -2622,9 +4527,15 @@ class RandomPixelGenerator:
         self.fps_index_var = tk.IntVar(value=1)  # 0=30, 1=60, 2=120 FPS
         self.fps_label_var = tk.StringVar(value=f"{VIDEO_DEFAULT_FPS} FPS")
         self.duration_var = tk.IntVar(value=VIDEO_DEFAULT_SECONDS)
+        self.video_codec_var = tk.StringVar(value=VIDEO_DEFAULT_CODEC)
+        self.current_video_codec = VIDEO_DEFAULT_CODEC
+        self.current_video_bitrate_kbps = VIDEO_DEFAULT_BITRATE_KBPS
         self.duration_label_var = tk.StringVar(
             value=f"{VIDEO_DEFAULT_SECONDS} seconds"
         )
+        self.rotation_degrees_var = tk.IntVar(value=0)
+        self.rotation_degrees_label_var = tk.StringVar(value="0°")
+        self.rotation_direction_var = tk.StringVar(value="Clockwise")
         self.gif_duration_var = tk.IntVar(value=GIF_DEFAULT_SECONDS)
         self.gif_resolution_var = tk.StringVar(
             value=format_gif_resolution(GIF_DEFAULT_RESOLUTION)
@@ -2738,14 +4649,19 @@ class RandomPixelGenerator:
         self.save_button.pack(side="left", padx=6)
 
         self.video_button = ttk.Button(
-            depth_frame, text="Export H.264 Video...", command=self.export_video
+            depth_frame, text="Export Video...", command=self.export_video
         )
         self.video_button.pack(side="left", padx=6)
+        self.cancel_video_button = ttk.Button(
+            depth_frame, text="Cancel Export", command=self.cancel_video_export,
+            state="disabled",
+        )
 
         self.gif_button = ttk.Button(
             depth_frame, text="Export GIF...", command=self.export_gif
         )
         self.gif_button.pack(side="left", padx=6)
+        self.cancel_video_button.pack_forget()
 
         # Keep color depth immediately before the bilinear filtering option.
         ttk.Label(depth_frame, text="Color depth:").pack(side="left", padx=(14, 5))
@@ -2873,6 +4789,59 @@ class RandomPixelGenerator:
         )
         self.gif_resolution_combo.grid(row=1, column=0, sticky="w")
 
+        rotation_frame = ttk.Frame(video_controls_frame)
+        rotation_frame.grid(row=1, column=0, padx=(0, 18), pady=(8, 0), sticky="nw")
+        ttk.Label(rotation_frame, text="H.265 image rotation:").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.rotation_scale = tk.Scale(
+            rotation_frame,
+            variable=self.rotation_degrees_var,
+            from_=0,
+            to=VIDEO_MAX_ROTATION_DEGREES,
+            resolution=1,
+            orient="horizontal",
+            showvalue=False,
+            length=330,
+            width=15,
+            sliderlength=18,
+            highlightthickness=0,
+            borderwidth=0,
+            command=self._on_rotation_change,
+        )
+        self.rotation_scale.grid(row=1, column=0, sticky="w")
+        ttk.Label(rotation_frame, text="0°").grid(row=2, column=0, sticky="w")
+        ttk.Label(rotation_frame, textvariable=self.rotation_degrees_label_var).grid(
+            row=2, column=0
+        )
+        ttk.Label(rotation_frame, text="720°").grid(row=2, column=0, sticky="e")
+        direction_frame = ttk.Frame(video_controls_frame)
+        direction_frame.grid(row=1, column=1, padx=(0, 0), pady=(8, 0), sticky="nw")
+        ttk.Label(direction_frame, text="Rotation direction:").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.rotation_direction_combo = ttk.Combobox(
+            direction_frame,
+            textvariable=self.rotation_direction_var,
+            values=["Clockwise", "Counterclockwise"],
+            width=17,
+            state="readonly",
+        )
+        self.rotation_direction_combo.grid(row=1, column=0, sticky="w")
+
+        encoding_frame = ttk.Frame(video_controls_frame)
+        encoding_frame.grid(row=2, column=0, columnspan=4, padx=(0, 0), pady=(8, 0), sticky="nw")
+        ttk.Label(encoding_frame, text="Video codec:").pack(side="left", padx=(0, 5))
+        self.video_codec_combo = ttk.Combobox(
+            encoding_frame, textvariable=self.video_codec_var,
+            values=VIDEO_CODEC_OPTIONS, width=14, state="readonly",
+        )
+        self.video_codec_combo.pack(side="left", padx=(0, 18))
+        ttk.Label(
+            encoding_frame,
+            text="Random 1×1: constant-quality mode (bitrate varies)  |  Other exports: 200 Mbit/s",
+        ).pack(side="left")
+
         self.progress = ttk.Progressbar(
             root, orient="horizontal", mode="determinate", maximum=self.current_video_frames
         )
@@ -2910,14 +4879,52 @@ class RandomPixelGenerator:
         self.root.after(60, self._poll_image_result)
         self.root.after(80, self._poll_video_result)
         self.root.after(80, self._poll_gif_result)
+        self.root.after(100, self._poll_batch_result)
+        self.root.after(100, self._poll_animation_result)
 
     def _create_menu(self):
-        """Create theme-family menus beside About at the right end of the menu bar."""
+        """Create Fractal Tools, Themes and About menus at the right end."""
         self.menu_bar = ttk.Frame(self.root, padding=(8, 2, 12, 2))
         self.menu_bar.pack(fill="x")
 
+        self.fractal_tools_menu = tk.Menu(self.root, tearoff=0)
+        self.fractal_tools_menu.add_command(
+            label="Save Current View as Bookmark...", command=self.save_current_bookmark
+        )
+        self.fractal_tools_menu.add_command(
+            label="Manage Fractal Bookmarks...", command=self.manage_bookmarks_dialog
+        )
+        self.fractal_tools_menu.add_separator()
+        self.fractal_tools_menu.add_command(
+            label="Undo Navigation     Ctrl+Z", command=self.undo_fractal_navigation
+        )
+        self.fractal_tools_menu.add_command(
+            label="Redo Navigation     Ctrl+Y", command=self.redo_fractal_navigation
+        )
+        self.fractal_tools_menu.add_separator()
+        self.fractal_tools_menu.add_command(
+            label="Open Fractal Gallery...", command=self.open_fractal_gallery
+        )
+        self.fractal_tools_menu.add_checkbutton(
+            label="Automatically Save New Fractals to Gallery",
+            variable=self.gallery_auto_save_var,
+            command=self._save_gallery_auto_save_preference,
+        )
+        self.fractal_tools_menu.add_command(
+            label="Edit Color Palettes...", command=self.open_palette_editor
+        )
+        self.fractal_tools_menu.add_separator()
+        self.fractal_tools_menu.add_command(
+            label="Batch Generate 100 / 1,000 Fractals...",
+            command=self.open_batch_generation_dialog,
+        )
+        self.fractal_tools_menu.add_command(
+            label="Fractal Animation Studio...",
+            command=self.open_fractal_animation_studio,
+        )
+
         self.themes_menu = tk.Menu(self.root, tearoff=0)
-        self._native_theme_menus = [self.themes_menu]
+        self._native_theme_menus = [self.fractal_tools_menu, self.themes_menu]
         for family_label, family_name in THEME_FAMILIES:
             family_menu = tk.Menu(self.themes_menu, tearoff=0)
             for mode in THEME_MODES:
@@ -2931,6 +4938,9 @@ class RandomPixelGenerator:
             self.themes_menu.add_cascade(label=family_label, menu=family_menu)
             self._native_theme_menus.append(family_menu)
 
+        self.fractal_tools_menu_button = ttk.Menubutton(
+            self.menu_bar, text="Fractal Tools", menu=self.fractal_tools_menu
+        )
         self.themes_menu_button = ttk.Menubutton(
             self.menu_bar, text="Themes", menu=self.themes_menu
         )
@@ -2938,15 +4948,17 @@ class RandomPixelGenerator:
         self.about_menu = tk.Menu(self.root, tearoff=0)
         self._native_theme_menus.append(self.about_menu)
         self.about_menu.add_command(
-            label="Pixel Generator V1.3", command=self.show_about
+            label="Pixel Generator V1.1", command=self.show_about
         )
         self.about_menu_button = ttk.Menubutton(
             self.menu_bar, text="About", menu=self.about_menu
         )
-        # Pack About first on the right so it remains the rightmost item;
-        # Themes is then packed immediately to its left.
+        # Keep Themes directly beside About, with Fractal Tools to their left.
         self.about_menu_button.pack(side="right")
         self.themes_menu_button.pack(side="right", padx=(0, 8))
+        self.fractal_tools_menu_button.pack(side="right", padx=(0, 8))
+        self.root.bind("<Control-z>", lambda _event: self.undo_fractal_navigation())
+        self.root.bind("<Control-y>", lambda _event: self.redo_fractal_navigation())
         self._apply_classic_widget_theme()
 
     def _apply_classic_widget_theme(self):
@@ -3068,7 +5080,7 @@ class RandomPixelGenerator:
 
         ttk.Label(
             content,
-            text="Pixel Generator V1.3",
+            text="Pixel Generator V1.1",
             font=("Segoe UI", 11, "bold"),
         ).pack(anchor="center", pady=(0, 10))
 
@@ -3149,7 +5161,8 @@ class RandomPixelGenerator:
 
     def _on_resolution_change(self, _event=None):
         """Apply a resolution preset, resize the window, and regenerate the image."""
-        if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
             return
         try:
             width, height = normalize_image_resolution(self.resolution_var.get())
@@ -3174,9 +5187,79 @@ class RandomPixelGenerator:
             return
         self._start_image_generation(
             "fractal",
-            fractal_type=self.current_fractal_type,
+            fractal_type=str(view_state.get("fractal_type", self.current_fractal_type)),
             fractal_view_state=dict(view_state),
         )
+
+    def _commit_fractal_view(self, view_state, render=True):
+        """Append a user navigation/palette change to the undo history."""
+        if not isinstance(view_state, dict):
+            return
+        state = dict(view_state)
+        if self.fractal_history_index >= 0:
+            self.fractal_history = self.fractal_history[:self.fractal_history_index + 1]
+        self.fractal_history.append(state)
+        if len(self.fractal_history) > MAX_FRACTAL_HISTORY:
+            self.fractal_history = self.fractal_history[-MAX_FRACTAL_HISTORY:]
+        self.fractal_history_index = len(self.fractal_history) - 1
+        self.current_fractal_view_state = state
+        if render:
+            self._render_fractal_view(state)
+        self._update_navigation_menu_state()
+
+    def _reset_fractal_history(self, view_state):
+        self.fractal_history = [dict(view_state)] if isinstance(view_state, dict) else []
+        self.fractal_history_index = 0 if self.fractal_history else -1
+        self.current_fractal_view_state = dict(view_state) if isinstance(view_state, dict) else None
+        self._update_navigation_menu_state()
+
+    def _update_navigation_menu_state(self):
+        menu = getattr(self, "fractal_tools_menu", None)
+        if menu is None:
+            return
+        try:
+            has_fractal = (
+                getattr(self, "current_image_type", None) == "fractal"
+                and isinstance(getattr(self, "current_fractal_view_state", None), dict)
+            )
+            undo_enabled = has_fractal and self.fractal_history_index > 0
+            redo_enabled = has_fractal and 0 <= self.fractal_history_index < len(self.fractal_history) - 1
+            # Menu order: bookmark, manager, separator, undo, redo.
+            menu.entryconfigure(0, state="normal" if has_fractal else "disabled")
+            menu.entryconfigure(3, state="normal" if undo_enabled else "disabled")
+            menu.entryconfigure(4, state="normal" if redo_enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def undo_fractal_navigation(self):
+        if (self.current_image_type != "fractal" or self.is_generating
+                or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
+            return
+        if self.fractal_history_index > 0:
+            self.fractal_history_index -= 1
+            state = dict(self.fractal_history[self.fractal_history_index])
+            self.current_fractal_type = state.get("fractal_type", self.current_fractal_type)
+            self.fractal_type_var.set(self.current_fractal_type)
+            self.current_image_type = "fractal"
+            self.current_fractal_view_state = state
+            self._render_fractal_view(state)
+            self._update_navigation_menu_state()
+
+    def redo_fractal_navigation(self):
+        if (self.current_image_type != "fractal" or self.is_generating
+                or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
+            return
+        if self.fractal_history_index < len(self.fractal_history) - 1:
+            self.fractal_history_index += 1
+            state = dict(self.fractal_history[self.fractal_history_index])
+            self.current_fractal_type = state.get("fractal_type", self.current_fractal_type)
+            self.fractal_type_var.set(self.current_fractal_type)
+            self.current_image_type = "fractal"
+            self.current_fractal_view_state = state
+            self._render_fractal_view(state)
+            self._update_navigation_menu_state()
 
     def reset_fractal_view(self):
         """Return to the randomized starting view for the current fractal."""
@@ -3186,11 +5269,11 @@ class RandomPixelGenerator:
             or self.is_generating
             or self.is_exporting_video
             or self.is_exporting_gif
+            or self.is_batch_generating
+            or self.is_exporting_animation
         ):
             return
-        self._render_fractal_view(
-            reset_fractal_view_state(self.current_fractal_view_state)
-        )
+        self._commit_fractal_view(reset_fractal_view_state(self.current_fractal_view_state))
 
     def _preview_coordinates(self, x, y):
         """Convert canvas coordinates to normalized image coordinates."""
@@ -3212,6 +5295,8 @@ class RandomPixelGenerator:
             or self.is_generating
             or self.is_exporting_video
             or self.is_exporting_gif
+            or self.is_batch_generating
+            or self.is_exporting_animation
         ):
             return
         if self._preview_coordinates(event.x, event.y) is None:
@@ -3259,7 +5344,7 @@ class RandomPixelGenerator:
             drag["view_state"], delta_x, delta_y,
             display_width, display_height,
         )
-        self._render_fractal_view(view_state)
+        self._commit_fractal_view(view_state)
 
     def _zoom_fractal_at(self, x, y, zoom_factor):
         if (
@@ -3268,6 +5353,8 @@ class RandomPixelGenerator:
             or self.is_generating
             or self.is_exporting_video
             or self.is_exporting_gif
+            or self.is_batch_generating
+            or self.is_exporting_animation
         ):
             return "break"
         ratios = self._preview_coordinates(x, y)
@@ -3282,7 +5369,7 @@ class RandomPixelGenerator:
             self.base_image.width, self.base_image.height,
         )
         if view_state["horizontal_span"] != self.current_fractal_view_state["horizontal_span"]:
-            self._render_fractal_view(view_state)
+            self._commit_fractal_view(view_state)
         return "break"
 
     def _on_fractal_mousewheel(self, event):
@@ -3333,7 +5420,8 @@ class RandomPixelGenerator:
 
     def _on_depth_change(self, _event=None):
         """Regenerate immediately when the user selects a different color depth."""
-        if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
             return
         if self.current_image_type == "fractal":
             self._render_fractal_view(self.current_fractal_view_state)
@@ -3387,6 +5475,8 @@ class RandomPixelGenerator:
         elif self.current_depth == 24:
             label += " (true color RGB)"
         if self.current_image_type == "fractal":
+            palette_name = (self.current_fractal_view_state or {}).get("palette_name", "Random")
+            label += f" | Palette: {palette_name}"
             label += " | Drag to pan · Mouse wheel to zoom"
             if self.current_render_backend == "GPU" and self.current_render_device:
                 label += f" | GPU: {self.current_render_device} (OpenCL)"
@@ -3408,6 +5498,13 @@ class RandomPixelGenerator:
         if value is not None:
             self.fps_index_var.set(max(0, min(2, int(float(value)))))
         self.fps_label_var.set(f"{self._get_selected_fps()} FPS")
+
+    def _on_rotation_change(self, value=None):
+        if value is not None:
+            self.rotation_degrees_var.set(max(0, min(VIDEO_MAX_ROTATION_DEGREES, int(round(float(value))))))
+        self.rotation_degrees_label_var.set(
+            f"{int(self.rotation_degrees_var.get())}°"
+        )
 
     def _on_duration_change(self, _value=None):
         seconds = int(self.duration_var.get())
@@ -3487,7 +5584,9 @@ class RandomPixelGenerator:
             pass
 
     def on_close(self):
-        """Save the final normal-state position and close the application."""
+        """Cancel an active video export, save position, and close the application."""
+        if self.active_video_export_control is not None:
+            self.active_video_export_control.cancel()
         if self._position_save_after_id is not None:
             try:
                 self.root.after_cancel(self._position_save_after_id)
@@ -3508,7 +5607,8 @@ class RandomPixelGenerator:
         )
 
     def _start_image_generation(self, image_type, fractal_type=None, fractal_view_state=None):
-        if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
             return
 
         settings = self.read_settings()
@@ -3557,9 +5657,14 @@ class RandomPixelGenerator:
             )
         self.resize_window_to_image(width, height)
 
+        custom_palette_stops = (
+            list(self.active_palette_stops)
+            if image_type == "fractal" and fractal_view_state is None and self.active_palette_stops
+            else None
+        )
         threading.Thread(
             target=self._image_worker,
-            args=(width, height, depth, image_type, fractal_type, rendering_mode, fractal_view_state),
+            args=(width, height, depth, image_type, fractal_type, rendering_mode, fractal_view_state, custom_palette_stops, self.active_palette_name),
             daemon=True,
         ).start()
 
@@ -3568,6 +5673,8 @@ class RandomPixelGenerator:
         fractal_type=DEFAULT_FRACTAL_TYPE,
         rendering_mode=DEFAULT_RENDERING_MODE,
         fractal_view_state=None,
+        custom_palette_stops=None,
+        custom_palette_name="Random",
     ):
         try:
             render_info = None
@@ -3624,6 +5731,11 @@ class RandomPixelGenerator:
                         view_state=fractal_view_state,
                         rng=(np.random.default_rng(fractal_seed) if fractal_seed is not None else None),
                         return_view_state=True,
+                        custom_palette=custom_palette_stops,
+                    )
+                    resulting_view_state["palette_name"] = (
+                        custom_palette_name if custom_palette_stops else
+                        str(fractal_view_state.get("palette_name", "Random")) if isinstance(fractal_view_state, dict) else "Random"
                     )
                 except Exception as gpu_exc:
                     # Automatic mode may recover from a transient OpenCL error.
@@ -3635,7 +5747,11 @@ class RandomPixelGenerator:
                         width, height, depth, fractal_type=fractal_type,
                         compute_backend="CPU", view_state=fractal_view_state,
                         rng=(np.random.default_rng(fractal_seed) if fractal_seed is not None else None),
-                        return_view_state=True,
+                        return_view_state=True, custom_palette=custom_palette_stops,
+                    )
+                    resulting_view_state["palette_name"] = (
+                        custom_palette_name if custom_palette_stops else
+                        str(fractal_view_state.get("palette_name", "Random")) if isinstance(fractal_view_state, dict) else "Random"
                     )
                     render_info = {
                         "backend": "CPU",
@@ -3655,6 +5771,7 @@ class RandomPixelGenerator:
                 (
                     "success", image, width, height, depth, color_count,
                     image_type, fractal_type, render_info, resulting_view_state,
+                    bool(image_type == "fractal" and fractal_view_state is None),
                 )
             )
         except Exception as exc:
@@ -3677,7 +5794,7 @@ class RandomPixelGenerator:
         else:
             (
                 _, self.base_image, width, height, depth, color_count,
-                image_type, fractal_type, render_info, fractal_view_state,
+                image_type, fractal_type, render_info, fractal_view_state, new_fractal_generation,
             ) = result
             self.current_depth = depth
             self.current_color_count = color_count
@@ -3715,74 +5832,125 @@ class RandomPixelGenerator:
                 self.current_fractal_view_state = fractal_view_state
             else:
                 self.current_fractal_view_state = None
+                self._reset_fractal_history(None)
             self._on_pixel_size_change()
             self.save_button.configure(state="normal")
+            if image_type == "fractal" and isinstance(fractal_view_state, dict):
+                if new_fractal_generation:
+                    self._reset_fractal_history(fractal_view_state)
+                    if self.gallery_auto_save_var.get():
+                        try:
+                            self._save_current_fractal_to_gallery(auto_saved=True)
+                        except Exception as gallery_exc:
+                            self.status_var.set(f"Fractal rendered; gallery save failed: {gallery_exc}")
+                elif self.fractal_history_index >= 0 and self.fractal_history_index < len(self.fractal_history):
+                    self.fractal_history[self.fractal_history_index] = dict(fractal_view_state)
+                else:
+                    self._reset_fractal_history(fractal_view_state)
             self._set_action_buttons()
 
         self.root.after(60, self._poll_image_result)
 
     def export_video(self):
-        if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
+            return
+        if self.image is None:
+            messagebox.showinfo(
+                "Generate an image first",
+                "Generate a random image or fractal before exporting a video.",
+            )
             return
 
-        settings = self.read_settings()
-        if settings is None:
-            return
-        width, height, depth, pixel_size = settings
-        bilinear = bool(self.bilinear_var.get())
-
+        source_type = "fractal" if self.current_image_type == "fractal" else "random"
+        source_image = (
+            self.image.copy().convert("RGB") if source_type == "fractal" else None
+        )
+        width, height = self.image.size
         if width * height > VIDEO_MAX_PIXELS:
             messagebox.showerror(
                 "Video resolution too large",
-                "H.264 video export is limited to 8,294,400 pixels per frame "
+                "Video export is limited to 8,294,400 pixels per frame "
                 "(up to 3840 × 2160 / 4K). Reduce the selected width or height.",
             )
             return
 
         duration_seconds = int(self.duration_var.get())
         fps = self._get_selected_fps()
+        video_codec = self.video_codec_var.get()
         bitrate_kbps = VIDEO_DEFAULT_BITRATE_KBPS
+        rotation_degrees = int(self.rotation_degrees_var.get())
+        rotation_direction = self.rotation_direction_var.get()
         total_frames = fps * duration_seconds
+        source_label = "fractal_snapshot" if source_type == "fractal" else "random_images"
+        export_pixel_size = int(self.pixel_size_var.get()) if source_type == "random" else 1
+        quality_mode = source_type == "random" and export_pixel_size == 1
+        rate_label = f"quality_qp{VIDEO_QUALITY_MODE_QP}" if quality_mode else "200mbit"
         default_name = (
-            f"random_pixels_{width}x{height}_{pixel_size}x{pixel_size}px_"
-            f"{'bilinear' if bilinear else 'nearest'}_"
-            f"{duration_seconds}s_{fps}fps_200mbit.mp4"
+            f"{source_label}_{width}x{height}_{duration_seconds}s_{fps}fps_"
+            f"{normalize_video_codec(video_codec)}_{rate_label}_"
+            f"rotate_{rotation_degrees}_{rotation_direction.lower()}.mp4"
         )
         output_path = filedialog.asksaveasfilename(
-            title="Export H.264 video",
+            title=f"Export {video_codec} video",
             initialfile=default_name,
             defaultextension=".mp4",
-            filetypes=[("MP4 video (H.264)", "*.mp4")],
+            filetypes=[("MP4 video (H.264 / H.265)", "*.mp4")],
         )
         if not output_path:
             return
 
         self.is_exporting_video = True
+        video_cancel_control = VideoExportControl()
+        self.active_video_export_control = video_cancel_control
         self._set_action_buttons()
         self.current_video_fps = fps
         self.current_video_frames = total_frames
         self.current_video_duration = duration_seconds
+        self.current_video_codec = video_codec
+        self.current_video_bitrate_kbps = VIDEO_DEFAULT_BITRATE_KBPS
+        self.current_video_quality_mode = quality_mode
         self.progress.configure(maximum=total_frames, value=0)
         self.progress.pack(fill="x", padx=12, pady=(0, 5))
+        if source_type == "random":
+            export_depth = int(self.current_depth or self.depth_var.get())
+            export_pixel_size = int(self.pixel_size_var.get())
+            export_bilinear = bool(self.bilinear_var.get())
+            source_description = (
+                f"fresh random frames, {export_depth}-bit, "
+                f"{export_pixel_size}×{export_pixel_size} pixels"
+            )
+        else:
+            export_depth = None
+            export_pixel_size = 1
+            export_bilinear = False
+            source_description = "the current fractal image"
+        rate_description = (
+            f"constant-quality QP {VIDEO_QUALITY_MODE_QP} (bitrate varies)"
+            if quality_mode else f"fixed target {VIDEO_DEFAULT_BITRATE_KBPS // 1000} Mbit/s"
+        )
         self.status_var.set(
-            f"Exporting H.264: {width} × {height}, {duration_seconds} seconds, "
-            f"{fps} fps, {pixel_size}×{pixel_size} pixel blocks, "
-            f"{'bilinear filtering' if bilinear else 'sharp pixel blocks'} mode, "
-            f"new random pattern per frame, fixed 200 Mbit/s bitrate..."
+            f"Exporting {source_description} as {video_codec}: {width} × {height}, "
+            f"{duration_seconds} seconds, {fps} fps, {rate_description}, "
+            f"rotating {rotation_degrees}° {rotation_direction.lower()}..."
         )
 
         threading.Thread(
             target=self._video_worker,
             args=(
-                output_path, width, height, depth, duration_seconds,
-                fps, bitrate_kbps, pixel_size, bilinear
+                output_path, source_type, source_image, width, height,
+                duration_seconds, fps, bitrate_kbps, rotation_degrees,
+                rotation_direction, export_depth, export_pixel_size,
+                export_bilinear, self.rendering_mode_var.get(), video_codec,
+                video_cancel_control,
             ),
             daemon=True,
         ).start()
 
     def export_gif(self):
         """Export a preset-resolution animated GIF at 30 FPS."""
-        if self.is_generating or self.is_exporting_video or self.is_exporting_gif:
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
             return
 
         try:
@@ -3900,56 +6068,170 @@ class RandomPixelGenerator:
 
         self.root.after(80, self._poll_gif_result)
 
+    def cancel_video_export(self):
+        """Cancel the active H.264/H.265 or Fractal Animation Studio export."""
+        control = self.active_video_export_control
+        if control is None or control.cancelled:
+            return
+        control.cancel()
+        self.cancel_video_button.configure(text="Cancelling...", state="disabled")
+        self.status_var.set("Cancelling export and removing the incomplete output file...")
+
     def _video_worker(
-        self, output_path, width, height, depth, duration_seconds,
-        fps, bitrate_kbps, pixel_size, bilinear
+        self,
+        output_path,
+        source_type,
+        source_image,
+        width,
+        height,
+        duration_seconds,
+        fps,
+        bitrate_kbps,
+        rotation_degrees,
+        rotation_direction,
+        export_depth,
+        export_pixel_size,
+        export_bilinear,
+        rendering_mode="Automatic",
+        video_codec=VIDEO_DEFAULT_CODEC,
+        cancel_control=None,
     ):
         try:
+            if cancel_control is not None:
+                cancel_control.check()
             def report_progress(frame_number):
                 self.video_queue.put(("progress", frame_number))
 
-            encode_random_h264_video(
-                output_path,
-                width,
-                height,
-                depth,
-                duration_seconds=duration_seconds,
-                fps=fps,
-                bitrate_kbps=bitrate_kbps,
-                pixel_size=pixel_size,
-                bilinear=bilinear,
-                progress_callback=report_progress,
-            )
-            self.video_queue.put(("success", output_path))
+            if source_type == "random":
+                # Every output frame gets a fresh pattern. GPU/Automatic uses
+                # OpenCL to generate and rotate batches before FFmpeg encoding.
+                video_info = encode_random_h264_video(
+                    output_path,
+                    width,
+                    height,
+                    export_depth,
+                    duration_seconds=duration_seconds,
+                    fps=fps,
+                    bitrate_kbps=bitrate_kbps,
+                    pixel_size=export_pixel_size,
+                    progress_callback=report_progress,
+                    bilinear=export_bilinear,
+                    rotation_degrees=rotation_degrees,
+                    rotation_direction=rotation_direction,
+                    compute_backend=rendering_mode,
+                    video_codec=video_codec,
+                    cancel_control=cancel_control,
+                )
+            else:
+                video_info = encode_rotating_image_h264_video(
+                    output_path,
+                    source_image,
+                    duration_seconds=duration_seconds,
+                    fps=fps,
+                    bitrate_kbps=bitrate_kbps,
+                    rotation_degrees=rotation_degrees,
+                    rotation_direction=rotation_direction,
+                    progress_callback=report_progress,
+                    compute_backend=rendering_mode,
+                    video_codec=video_codec,
+                    cancel_control=cancel_control,
+                )
+            if cancel_control is not None:
+                cancel_control.check()
+            if not isinstance(video_info, dict):
+                video_info = None
+            self.video_queue.put(("success", output_path, video_info))
+        except VideoExportCancelled:
+            removed, cleanup_error = _remove_incomplete_video_file(output_path)
+            self.video_queue.put(("cancelled", output_path, removed, cleanup_error))
         except Exception as exc:
-            self.video_queue.put(("error", str(exc)))
+            if cancel_control is not None and cancel_control.cancelled:
+                removed, cleanup_error = _remove_incomplete_video_file(output_path)
+                self.video_queue.put(("cancelled", output_path, removed, cleanup_error))
+            else:
+                self.video_queue.put(("error", str(exc)))
 
     def _poll_video_result(self):
         try:
             while True:
                 result = self.video_queue.get_nowait()
                 if result[0] == "progress":
+                    if self.active_video_export_control is not None and self.active_video_export_control.cancelled:
+                        continue
                     completed = result[1]
                     self.progress.configure(value=completed)
                     self.status_var.set(
-                        f"Encoding H.264: frame {completed}/{self.current_video_frames} "
+                        f"Encoding {self.current_video_codec}: frame {completed}/{self.current_video_frames} "
                         f"({completed / self.current_video_fps:.1f}/"
                         f"{self.current_video_duration} seconds)"
                     )
                 elif result[0] == "success":
                     self.is_exporting_video = False
+                    self.active_video_export_control = None
                     self.progress.configure(value=self.current_video_frames)
                     self._set_action_buttons()
-                    self.status_var.set(f"Saved H.264 MP4: {result[1]}")
+                    info = result[2] if len(result) > 2 and isinstance(result[2], dict) else {}
+                    fallback_reason = info.get("fallback_reason")
+                    encoder_fallback = info.get("encoder_fallback_reason")
+                    if info.get("backend") == "GPU":
+                        renderer_label = f"OpenCL GPU: {info.get('device') or 'GPU'}"
+                    elif fallback_reason:
+                        renderer_label = "CPU renderer (Automatic OpenCL fallback)"
+                    else:
+                        renderer_label = "CPU renderer"
+                    codec_label = info.get("codec", video_codec_label(self.current_video_codec))
+                    encoder_label = info.get("encoder_label", f"{codec_label} encoder")
+                    self.status_var.set(
+                        f"Saved {codec_label} MP4 ({encoder_label}; {renderer_label}): {result[1]}"
+                    )
+                    notes = []
+                    if fallback_reason:
+                        notes.append(
+                            "Automatic rendering mode used the CPU because OpenCL was unavailable:\n"
+                            + fallback_reason
+                        )
+                    if encoder_fallback:
+                        notes.append(
+                            f"NVENC was unavailable, so {codec_label} was encoded on the CPU:\n"
+                            + encoder_fallback
+                        )
+                    completion_note = "\n\n" + "\n\n".join(notes) if notes else ""
+                    quality_mode = bool(info.get("quality_mode", getattr(self, "current_video_quality_mode", False)))
+                    rate_description = (
+                        f"Rate control: {info.get('rate_control', f'Constant QP {VIDEO_QUALITY_MODE_QP}')} (bitrate varies)\n"
+                        if quality_mode else
+                        f"Target bitrate: {VIDEO_DEFAULT_BITRATE_KBPS // 1000} Mbit/s\n"
+                    )
                     messagebox.showinfo(
-                        "Video export complete",
+                        f"{codec_label} video export complete",
                         f"Your {self.current_video_duration}-second, "
-                        f"{self.current_video_fps}-fps H.264 MP4 video has been saved:\n\n"
-                        + result[1],
+                        f"{self.current_video_fps}-fps {codec_label} MP4 video has been saved.\n\n"
+                        + rate_description
+                        + f"Video encoder: {encoder_label}\n"
+                        + f"Frame renderer: {renderer_label}\n\n" + result[1] + completion_note,
                     )
                     self.progress.pack_forget()
+                elif result[0] == "cancelled":
+                    self.is_exporting_video = False
+                    self.active_video_export_control = None
+                    self.progress.configure(value=0)
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    removed = result[2] if len(result) > 2 else not os.path.exists(result[1])
+                    cleanup_error = result[3] if len(result) > 3 else None
+                    if removed:
+                        self.status_var.set("Video export cancelled. Incomplete MP4 deleted.")
+                    else:
+                        self.status_var.set("Video export cancelled, but the incomplete MP4 could not be deleted.")
+                        messagebox.showwarning(
+                            "Incomplete video could not be deleted",
+                            "The export was cancelled, but Windows still has the incomplete file locked. "
+                            "Close any application using it and delete it manually.\n\n"
+                            f"File: {result[1]}\nReason: {cleanup_error or 'File is still in use.'}",
+                        )
                 elif result[0] == "error":
                     self.is_exporting_video = False
+                    self.active_video_export_control = None
                     self._set_action_buttons()
                     self.progress.pack_forget()
                     self.status_var.set("Video export failed.")
@@ -3959,8 +6241,974 @@ class RandomPixelGenerator:
 
         self.root.after(80, self._poll_video_result)
 
+    # ------------------------------------------------------------------
+    # Fractal workspace: bookmarks, history, gallery and custom palettes
+    # ------------------------------------------------------------------
+    def _save_gallery_auto_save_preference(self):
+        try:
+            save_gallery_auto_save(self.gallery_auto_save_var.get())
+        except OSError as exc:
+            messagebox.showerror("Gallery preference", f"Could not save gallery preference: {exc}")
+
+    def save_current_bookmark(self):
+        if self.current_image_type != "fractal" or not isinstance(self.current_fractal_view_state, dict):
+            messagebox.showinfo("Fractal bookmark", "Generate or load a fractal before saving a bookmark.")
+            return
+        name = simpledialog.askstring(
+            "Save fractal bookmark", "Bookmark name:", parent=self.root,
+            initialvalue=f"{self.current_fractal_type} view",
+        )
+        if not name or not name.strip():
+            return
+        width, height = self.base_image.size if self.base_image is not None else DEFAULT_IMAGE_RESOLUTION
+        record = {
+            "name": name.strip(),
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "fractal_type": self.current_fractal_type,
+            "view_state": dict(self.current_fractal_view_state),
+            "width": int(width), "height": int(height),
+            "depth": int(self.current_depth or int(self.depth_var.get())),
+            "pixel_size": int(self.pixel_size_var.get()),
+            "bilinear": bool(self.bilinear_var.get()),
+        }
+        self.bookmarks.append(record)
+        try:
+            save_fractal_bookmarks(self.bookmarks, self.bookmarks_path)
+            self.status_var.set(f"Saved fractal bookmark: {record['name']}")
+        except Exception as exc:
+            self.bookmarks.pop()
+            messagebox.showerror("Bookmark save failed", str(exc))
+
+    def _restore_saved_view_settings(self, record):
+        state = dict(record.get("view_state", {}))
+        fractal_type = record.get("fractal_type", state.get("fractal_type", DEFAULT_FRACTAL_TYPE))
+        if fractal_type not in FRACTAL_TYPE_OPTIONS:
+            raise ValueError("The saved fractal type is not supported by this version.")
+        width = int(record.get("width", self.width_var.get()))
+        height = int(record.get("height", self.height_var.get()))
+        if width <= 0 or height <= 0 or width * height > IMAGE_MAX_PIXELS:
+            raise ValueError("The saved image dimensions are no longer supported.")
+        self.width_var.set(str(width))
+        self.height_var.set(str(height))
+        for label, preset_width, preset_height in IMAGE_RESOLUTION_PRESETS:
+            if (preset_width, preset_height) == (width, height):
+                self.resolution_var.set(label)
+                break
+        depth = int(record.get("depth", self.depth_var.get()))
+        if depth in COLOR_DEPTH_OPTIONS:
+            self.depth_var.set(str(depth))
+        pixel_size = int(record.get("pixel_size", self.pixel_size_var.get()))
+        if 1 <= pixel_size <= 32:
+            self.pixel_size_var.set(pixel_size)
+            self._on_pixel_size_change()
+        self.bilinear_var.set(bool(record.get("bilinear", self.bilinear_var.get())))
+        state["fractal_type"] = fractal_type
+        self.current_fractal_type = fractal_type
+        self.fractal_type_var.set(fractal_type)
+        self.current_image_type = "fractal"
+        if state.get("palette_stops"):
+            self.active_palette_stops = normalize_palette_stops(state["palette_stops"])
+            self.active_palette_name = str(state.get("palette_name", "Custom"))
+            save_active_palette(self.active_palette_name)
+        else:
+            self.active_palette_stops = None
+            self.active_palette_name = "Random"
+            save_active_palette("Random")
+        self._reset_fractal_history(state)
+        self._render_fractal_view(state)
+
+    def manage_bookmarks_dialog(self):
+        self.bookmarks = load_fractal_bookmarks(self.bookmarks_path)
+        window = tk.Toplevel(self.root)
+        window.title("Fractal Bookmarks")
+        window.transient(self.root)
+        window.geometry("620x390")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        listbox = tk.Listbox(window, height=14, activestyle="dotbox")
+        listbox.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=10, pady=10)
+        scrollbar = ttk.Scrollbar(window, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=3, sticky="ns", pady=10)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        def refresh():
+            listbox.delete(0, "end")
+            for item in self.bookmarks:
+                state = item.get("view_state", {})
+                zoom = float(state.get("home_horizontal_span", 1.0)) / max(1e-14, float(state.get("horizontal_span", 1.0)))
+                listbox.insert("end", f"{item.get('name', 'Untitled')}  |  {item.get('fractal_type', 'Fractal')}  |  {zoom:.2f}× zoom  |  {item.get('created', '')}")
+
+        def load_selected():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showinfo("Fractal Bookmarks", "Select a bookmark first.", parent=window)
+                return
+            try:
+                self._restore_saved_view_settings(self.bookmarks[selection[0]])
+                window.destroy()
+            except Exception as exc:
+                messagebox.showerror("Could not load bookmark", str(exc), parent=window)
+
+        def delete_selected():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            item = self.bookmarks[selection[0]]
+            if not messagebox.askyesno("Delete bookmark", f"Delete '{item.get('name', 'Untitled')}'?", parent=window):
+                return
+            del self.bookmarks[selection[0]]
+            try:
+                save_fractal_bookmarks(self.bookmarks, self.bookmarks_path)
+                refresh()
+            except Exception as exc:
+                messagebox.showerror("Bookmark delete failed", str(exc), parent=window)
+
+        ttk.Button(window, text="Load selected", command=load_selected).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Button(window, text="Delete selected", command=delete_selected).grid(row=1, column=1, sticky="w", padx=4, pady=(0, 10))
+        ttk.Button(window, text="Close", command=window.destroy).grid(row=1, column=2, sticky="e", padx=10, pady=(0, 10))
+        listbox.bind("<Double-Button-1>", lambda _event: load_selected())
+        refresh()
+
+    def _save_current_fractal_to_gallery(self, auto_saved=False):
+        if self.current_image_type != "fractal" or self.image is None or not isinstance(self.current_fractal_view_state, dict):
+            return None
+        width, height = self.image.size
+        metadata = {
+            "name": f"{self.current_fractal_type} – {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "fractal_type": self.current_fractal_type,
+            "view_state": dict(self.current_fractal_view_state),
+            "width": int(width), "height": int(height),
+            "depth": int(self.current_depth or 24),
+            "pixel_size": int(self.pixel_size_var.get()),
+            "bilinear": bool(self.bilinear_var.get()),
+            "palette_name": self.active_palette_name,
+            "render_backend": self.current_render_backend,
+            "render_seconds": self.current_render_seconds,
+            "auto_saved": bool(auto_saved),
+        }
+        return save_gallery_entry(self.image, metadata)
+
+    def open_fractal_gallery(self):
+        window = tk.Toplevel(self.root)
+        window.title("Fractal Gallery")
+        window.transient(self.root)
+        window.geometry("760x460")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        listbox = tk.Listbox(window, height=16, activestyle="dotbox")
+        listbox.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=10, pady=10)
+        scrollbar = ttk.Scrollbar(window, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=4, sticky="ns", pady=10)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        entries = []
+
+        def refresh():
+            nonlocal entries
+            entries = list_gallery_entries()
+            listbox.delete(0, "end")
+            for item in entries:
+                listbox.insert("end", f"{item.get('name', item.get('fractal_type', 'Fractal'))}  |  {item.get('width')}×{item.get('height')}  |  {item.get('created', '')}")
+
+        def load_selected():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            try:
+                self._restore_saved_view_settings(entries[selection[0]])
+                window.destroy()
+            except Exception as exc:
+                messagebox.showerror("Gallery load failed", str(exc), parent=window)
+
+        def delete_selected():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            entry = entries[selection[0]]
+            if not messagebox.askyesno("Delete gallery item", f"Delete '{entry.get('name', 'Fractal')}'?", parent=window):
+                return
+            for path in (entry.get("metadata_file"), entry.get("image_path")):
+                try:
+                    if path and os.path.isfile(path):
+                        os.remove(path)
+                except OSError as exc:
+                    messagebox.showerror("Gallery delete failed", str(exc), parent=window)
+                    return
+            refresh()
+
+        def open_folder():
+            folder = get_gallery_directory()
+            os.makedirs(folder, exist_ok=True)
+            try:
+                if os.name == "nt":
+                    os.startfile(folder)
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception as exc:
+                messagebox.showerror("Could not open gallery folder", str(exc), parent=window)
+
+        ttk.Button(window, text="Load selected", command=load_selected).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Button(window, text="Delete selected", command=delete_selected).grid(row=1, column=1, sticky="w", padx=4, pady=(0, 10))
+        ttk.Button(window, text="Open folder", command=open_folder).grid(row=1, column=2, sticky="w", padx=4, pady=(0, 10))
+        ttk.Button(window, text="Close", command=window.destroy).grid(row=1, column=3, sticky="e", padx=10, pady=(0, 10))
+        listbox.bind("<Double-Button-1>", lambda _event: load_selected())
+        refresh()
+
+    def open_palette_editor(self):
+        window = tk.Toplevel(self.root)
+        window.title("Custom Fractal Color Palettes")
+        window.transient(self.root)
+        window.geometry("650x470")
+        window.columnconfigure(0, weight=1)
+        window.columnconfigure(1, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        ttk.Label(window, text="Saved palettes").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(window, text="Gradient color stops").grid(row=0, column=1, sticky="w", padx=10, pady=(10, 4))
+        saved_list = tk.Listbox(window, height=14, activestyle="dotbox")
+        saved_list.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=4)
+        stops_list = tk.Listbox(window, height=14, activestyle="dotbox")
+        stops_list.grid(row=1, column=1, sticky="nsew", padx=(5, 10), pady=4)
+        name_var = tk.StringVar(value="My Gradient")
+        ttk.Label(window, text="Palette name:").grid(row=2, column=0, sticky="w", padx=10, pady=(8, 2))
+        name_entry = ttk.Entry(window, textvariable=name_var)
+        name_entry.grid(row=3, column=0, sticky="ew", padx=10)
+        draft = ["#050816", "#00B7C7", "#F9C74F", "#FFFFFF"]
+
+        def refresh_stops():
+            stops_list.delete(0, "end")
+            for stop in draft:
+                stops_list.insert("end", stop)
+
+        def refresh_saved(select_name=None):
+            saved_list.delete(0, "end")
+            saved_list.insert("end", "Random (built-in spectrum)")
+            for name in sorted(self.custom_palettes, key=str.casefold):
+                saved_list.insert("end", name)
+                if name == select_name:
+                    saved_list.selection_set(saved_list.size() - 1)
+            if select_name == "Random":
+                saved_list.selection_set(0)
+
+        def load_saved(_event=None):
+            selection = saved_list.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            if index == 0:
+                name_var.set("Random")
+                draft[:] = ["#000000", "#00B7C7", "#FFFFFF"]
+            else:
+                selected_name = saved_list.get(index)
+                name_var.set(selected_name)
+                draft[:] = list(self.custom_palettes.get(selected_name, draft))
+            refresh_stops()
+
+        def add_stop():
+            _rgb, color = colorchooser.askcolor(parent=window, title="Add gradient color")
+            if color:
+                if len(draft) >= 16:
+                    messagebox.showinfo("Palette editor", "A gradient can have at most 16 stops.", parent=window)
+                    return
+                draft.append(color.upper())
+                refresh_stops()
+                stops_list.selection_set(stops_list.size() - 1)
+
+        def edit_stop():
+            selection = stops_list.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            _rgb, color = colorchooser.askcolor(color=draft[index], parent=window, title="Edit gradient color")
+            if color:
+                draft[index] = color.upper()
+                refresh_stops()
+                stops_list.selection_set(index)
+
+        def remove_stop():
+            selection = stops_list.curselection()
+            if not selection:
+                return
+            if len(draft) <= 2:
+                messagebox.showinfo("Palette editor", "A gradient needs at least two color stops.", parent=window)
+                return
+            del draft[selection[0]]
+            refresh_stops()
+
+        def save_palette():
+            name = name_var.get().strip()
+            try:
+                if not name or name.lower() == "random":
+                    raise ValueError("Choose a palette name other than Random.")
+                stops = normalize_palette_stops(draft)
+                self.custom_palettes[name] = stops
+                save_custom_palettes(self.custom_palettes, self.custom_palettes_path)
+                refresh_saved(name)
+                self.status_var.set(f"Saved custom palette: {name}")
+            except Exception as exc:
+                messagebox.showerror("Palette save failed", str(exc), parent=window)
+
+        def apply_palette():
+            name = name_var.get().strip()
+            if name.lower() == "random":
+                self.active_palette_name = "Random"
+                self.active_palette_stops = None
+                save_active_palette("Random")
+                if self.current_image_type == "fractal" and isinstance(self.current_fractal_view_state, dict):
+                    state = dict(self.current_fractal_view_state)
+                    state["palette_stops"] = None
+                    state["palette_name"] = "Random"
+                    self._commit_fractal_view(state)
+                else:
+                    self.status_var.set("Random fractal color spectrum selected for the next generation.")
+                return
+            try:
+                stops = normalize_palette_stops(draft)
+                if name not in self.custom_palettes:
+                    self.custom_palettes[name] = stops
+                    save_custom_palettes(self.custom_palettes, self.custom_palettes_path)
+                self.active_palette_name = name
+                self.active_palette_stops = stops
+                save_active_palette(name)
+                if self.current_image_type == "fractal" and isinstance(self.current_fractal_view_state, dict):
+                    state = dict(self.current_fractal_view_state)
+                    state["palette_stops"] = list(stops)
+                    state["palette_name"] = name
+                    self._commit_fractal_view(state)
+                else:
+                    self.status_var.set(f"Custom palette '{name}' will be used for the next fractal.")
+            except Exception as exc:
+                messagebox.showerror("Palette apply failed", str(exc), parent=window)
+
+        def delete_palette():
+            selection = saved_list.curselection()
+            if not selection or selection[0] == 0:
+                return
+            name = saved_list.get(selection[0])
+            if not messagebox.askyesno("Delete palette", f"Delete '{name}'?", parent=window):
+                return
+            self.custom_palettes.pop(name, None)
+            save_custom_palettes(self.custom_palettes, self.custom_palettes_path)
+            if self.active_palette_name == name:
+                self.active_palette_name = "Random"
+                self.active_palette_stops = None
+                save_active_palette("Random")
+            refresh_saved()
+
+        saved_list.bind("<<ListboxSelect>>", load_saved)
+        saved_list.bind("<Double-Button-1>", load_saved)
+        controls = ttk.Frame(window, padding=10)
+        controls.grid(row=4, column=0, columnspan=2, sticky="ew")
+        for text, command in (
+            ("Add stop", add_stop), ("Edit selected", edit_stop),
+            ("Remove selected", remove_stop), ("Save palette", save_palette),
+            ("Apply palette", apply_palette), ("Delete palette", delete_palette),
+            ("Close", window.destroy),
+        ):
+            ttk.Button(controls, text=text, command=command).pack(side="left", padx=3)
+        refresh_saved(self.active_palette_name)
+        refresh_stops()
+
+    # ------------------------------------------------------------------
+    # Batch fractal generation
+    # ------------------------------------------------------------------
+    def open_batch_generation_dialog(self):
+        if (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation):
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Batch Fractal Generation")
+        window.transient(self.root)
+        window.resizable(False, False)
+        count_var = tk.StringVar(value="100")
+        family_var = tk.StringVar(value="Random (all seven families)")
+        folder_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Pictures", "Pixel Generator Batch"))
+        ttk.Label(window, text="Number of fractals:").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        count_combo = ttk.Combobox(window, textvariable=count_var, values=[str(v) for v in BATCH_GENERATION_COUNTS], width=12, state="readonly")
+        count_combo.grid(row=0, column=1, sticky="w", padx=8, pady=(12, 4))
+        ttk.Label(window, text="Fractal family:").grid(row=1, column=0, sticky="w", padx=12, pady=4)
+        family_combo = ttk.Combobox(window, textvariable=family_var, values=["Random (all seven families)"] + list(FRACTAL_TYPE_OPTIONS), width=28, state="readonly")
+        family_combo.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(window, text="Output folder:").grid(row=2, column=0, sticky="w", padx=12, pady=4)
+        ttk.Entry(window, textvariable=folder_var, width=42).grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+
+        def choose_folder():
+            selected = filedialog.askdirectory(parent=window, initialdir=folder_var.get())
+            if selected:
+                folder_var.set(selected)
+
+        ttk.Button(window, text="Browse...", command=choose_folder).grid(row=2, column=2, padx=(0, 12), pady=4)
+        width, height = int(self.width_var.get()), int(self.height_var.get())
+        ttk.Label(window, text=f"Current output: {width} × {height}, {self.depth_var.get()}-bit, {self.rendering_mode_var.get()} renderer").grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=8)
+        ttk.Label(window, text="Each image is saved as PNG with a matching JSON file containing its fractal coordinates and parameters.", wraplength=520).grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=4)
+
+        def start_batch():
+            try:
+                count = int(count_var.get())
+                if count not in BATCH_GENERATION_COUNTS:
+                    raise ValueError("Choose either 100 or 1,000 images.")
+                folder = folder_var.get().strip()
+                if not folder:
+                    raise ValueError("Choose an output folder.")
+                os.makedirs(folder, exist_ok=True)
+                settings = self.read_settings()
+                if settings is None:
+                    return
+                width, height, depth, pixel_size = settings
+            except Exception as exc:
+                messagebox.showerror("Batch settings", str(exc), parent=window)
+                return
+            if count == 1000 and not messagebox.askyesno(
+                "Generate 1,000 fractals?",
+                f"This will render and save 1,000 images at {width}×{height}. It may take a long time and use substantial disk space. Continue?",
+                parent=window,
+            ):
+                return
+            family = family_var.get()
+            window.destroy()
+            self._start_batch_generation(count, family, folder, width, height, depth, pixel_size)
+
+        button_row = ttk.Frame(window, padding=12)
+        button_row.grid(row=5, column=0, columnspan=3, sticky="e")
+        ttk.Button(button_row, text="Start batch", command=start_batch).pack(side="right", padx=4)
+        ttk.Button(button_row, text="Cancel", command=window.destroy).pack(side="right", padx=4)
+
+    def _start_batch_generation(self, count, family, folder, width, height, depth, pixel_size):
+        if self.is_batch_generating:
+            return
+        self.is_batch_generating = True
+        self.batch_cancel_event.clear()
+        self._set_action_buttons()
+        self.progress.configure(maximum=count, value=0)
+        self.progress.pack(fill="x", padx=12, pady=(0, 5))
+        self.status_var.set(f"Preparing batch of {count} fractals...")
+        window = tk.Toplevel(self.root)
+        window.title("Batch Generation Progress")
+        window.transient(self.root)
+        self.batch_window = window
+        ttk.Label(window, text=f"Generating {count} fractals").pack(padx=15, pady=(14, 4))
+        self.batch_status_label = ttk.Label(window, text="Starting...")
+        self.batch_status_label.pack(padx=15, pady=4)
+        self.batch_progress = ttk.Progressbar(window, maximum=count, value=0, length=420)
+        self.batch_progress.pack(padx=15, pady=8)
+        ttk.Button(window, text="Cancel batch", command=self.batch_cancel_event.set).pack(pady=(2, 14))
+        threading.Thread(
+            target=self._batch_generation_worker,
+            args=(count, family, folder, width, height, depth, pixel_size,
+                  bool(self.bilinear_var.get()), self.rendering_mode_var.get(),
+                  list(self.active_palette_stops) if self.active_palette_stops else None,
+                  self.active_palette_name, bool(self.gallery_auto_save_var.get())),
+            daemon=True,
+        ).start()
+
+    def _batch_generation_worker(self, count, family, folder, width, height, depth, pixel_size, bilinear, rendering_mode, palette_stops, palette_name, auto_save_gallery):
+        completed = 0
+        rng = np.random.default_rng()
+        families = list(FRACTAL_TYPE_OPTIONS)
+        try:
+            gallery_dir = get_gallery_directory()
+            for index in range(int(count)):
+                if self.batch_cancel_event.is_set():
+                    break
+                fractal_type = str(rng.choice(families)) if family.startswith("Random") else family
+                backend, renderer, _info = resolve_fractal_render_backend(width, height, fractal_type, rendering_mode)
+                image, color_count, view_state = generate_fractal_image(
+                    width, height, depth, fractal_type=fractal_type,
+                    compute_backend=backend, opencl_renderer=renderer, rng=rng,
+                    return_view_state=True, custom_palette=palette_stops,
+                )
+                view_state["palette_name"] = palette_name
+                final_image = pixelate_image(image, pixel_size, bilinear=bilinear)
+                filename = f"fractal_{index + 1:04d}_{fractal_type.lower().replace(' ', '_').replace('(', '').replace(')', '')}_{width}x{height}.png"
+                output_path = os.path.join(folder, filename)
+                final_image.save(output_path, "PNG", optimize=False)
+                metadata = {
+                    "name": filename, "fractal_type": fractal_type,
+                    "view_state": view_state, "width": width, "height": height,
+                    "depth": depth, "pixel_size": pixel_size, "bilinear": bilinear,
+                    "palette_name": palette_name, "batch_index": index + 1,
+                }
+                _atomic_write_json(os.path.splitext(output_path)[0] + ".json", metadata)
+                if auto_save_gallery:
+                    try:
+                        save_gallery_entry(final_image, metadata, gallery_dir)
+                    except Exception:
+                        pass
+                completed = index + 1
+                self.batch_queue.put(("progress", completed, count, fractal_type))
+            self.batch_queue.put(("success", completed, count, folder, self.batch_cancel_event.is_set()))
+        except Exception as exc:
+            self.batch_queue.put(("error", str(exc), completed, count))
+
+    def _poll_batch_result(self):
+        try:
+            while True:
+                item = self.batch_queue.get_nowait()
+                if item[0] == "progress":
+                    _, completed, total, family = item
+                    if self.batch_progress is not None:
+                        self.batch_progress.configure(value=completed)
+                    if self.batch_status_label is not None:
+                        self.batch_status_label.configure(text=f"{completed:,} / {total:,} completed — {family}")
+                    self.status_var.set(f"Batch generation: {completed:,}/{total:,} fractals")
+                elif item[0] == "success":
+                    _, completed, total, folder, cancelled = item
+                    self.is_batch_generating = False
+                    self._set_action_buttons()
+                    self.progress.pack_forget()
+                    if self.batch_window is not None:
+                        self.batch_window.destroy()
+                        self.batch_window = None
+                    message = f"Saved {completed:,} of {total:,} fractals to:\n\n{folder}"
+                    if cancelled:
+                        message = "Batch cancelled.\n\n" + message
+                    self.status_var.set(f"Batch complete: {completed:,}/{total:,} fractals saved")
+                    messagebox.showinfo("Batch generation complete", message)
+                elif item[0] == "error":
+                    _, error, completed, total = item
+                    self.is_batch_generating = False
+                    self._set_action_buttons()
+                    self.progress.pack_forget()
+                    if self.batch_window is not None:
+                        self.batch_window.destroy()
+                        self.batch_window = None
+                    messagebox.showerror("Batch generation failed", f"{error}\n\nCompleted before failure: {completed}/{total}")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_batch_result)
+
+    # ------------------------------------------------------------------
+    # Fractal Animation Studio
+    # ------------------------------------------------------------------
+    def open_fractal_animation_studio(self):
+        if self.current_image_type != "fractal" or not isinstance(self.current_fractal_view_state, dict):
+            messagebox.showinfo("Fractal Animation Studio", "Generate or load a fractal first, then open the Animation Studio.")
+            return
+        if self.is_generating or self.is_batch_generating or self.is_exporting_animation:
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Fractal Animation Studio")
+        window.transient(self.root)
+        window.resizable(False, False)
+        duration_var = tk.StringVar(value=str(ANIMATION_DEFAULT_SECONDS))
+        fps_var = tk.StringVar(value=str(ANIMATION_DEFAULT_FPS))
+        zoom_var = tk.StringVar(value="25")
+        target_x_var = tk.StringVar(value="50")
+        target_y_var = tk.StringVar(value="50")
+        rotation_var = tk.IntVar(value=int(self.rotation_degrees_var.get()))
+        rotation_direction_var = tk.StringVar(value=self.rotation_direction_var.get())
+        animation_codec_var = tk.StringVar(value=self.video_codec_var.get())
+        animation_gif_resolution_var = tk.StringVar(value=self.gif_resolution_var.get())
+        ttk.Label(window, text=f"Current fractal: {self.current_fractal_type}").grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 8))
+        ttk.Label(window, text="Duration (seconds):").grid(row=1, column=0, sticky="w", padx=14, pady=5)
+        ttk.Spinbox(window, from_=1, to=60, textvariable=duration_var, width=12).grid(row=1, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Frame rate:").grid(row=2, column=0, sticky="w", padx=14, pady=5)
+        ttk.Combobox(window, textvariable=fps_var, values=["30", "60", "120"], width=10, state="readonly").grid(row=2, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Zoom factor:").grid(row=3, column=0, sticky="w", padx=14, pady=5)
+        ttk.Combobox(window, textvariable=zoom_var, values=[str(v) for v in ANIMATION_ZOOM_OPTIONS], width=10, state="readonly").grid(row=3, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Target position X (%):").grid(row=4, column=0, sticky="w", padx=14, pady=5)
+        ttk.Spinbox(window, from_=0, to=100, textvariable=target_x_var, width=12).grid(row=4, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Target position Y (%):").grid(row=5, column=0, sticky="w", padx=14, pady=5)
+        ttk.Spinbox(window, from_=0, to=100, textvariable=target_y_var, width=12).grid(row=5, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Rotation angle (0–720°):").grid(row=6, column=0, sticky="w", padx=14, pady=5)
+        rotation_frame = ttk.Frame(window)
+        rotation_frame.grid(row=6, column=1, sticky="w", padx=10, pady=5)
+        rotation_label_var = tk.StringVar(value=f"{rotation_var.get()}°")
+        def update_animation_rotation(value=None):
+            if value is not None:
+                rotation_var.set(max(0, min(VIDEO_MAX_ROTATION_DEGREES, int(round(float(value))))))
+            rotation_label_var.set(f"{rotation_var.get()}°")
+        tk.Scale(
+            rotation_frame, variable=rotation_var, from_=0, to=VIDEO_MAX_ROTATION_DEGREES,
+            resolution=1, orient="horizontal", showvalue=False,
+            length=220, width=14, sliderlength=18,
+            highlightthickness=0, borderwidth=0,
+            command=update_animation_rotation,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(rotation_frame, textvariable=rotation_label_var, width=5).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(window, text="Rotation direction:").grid(row=7, column=0, sticky="w", padx=14, pady=5)
+        ttk.Combobox(
+            window, textvariable=rotation_direction_var,
+            values=["Clockwise", "Counterclockwise"],
+            width=18, state="readonly",
+        ).grid(row=7, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(window, text="Video codec:").grid(row=8, column=0, sticky="w", padx=14, pady=5)
+        animation_format_frame = ttk.Frame(window)
+        animation_format_frame.grid(row=8, column=1, sticky="w", padx=10, pady=5)
+        ttk.Combobox(
+            animation_format_frame, textvariable=animation_codec_var,
+            values=VIDEO_CODEC_OPTIONS, width=14, state="readonly",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Label(window, text=f"MP4 output resolution: {self.base_image.width} × {self.base_image.height}\nMP4 target bitrate: {VIDEO_DEFAULT_BITRATE_KBPS // 1000} Mbit/s\nRenderer: {self.rendering_mode_var.get()}\nThe animation smoothly zooms toward the selected target while rotating.", justify="left").grid(row=9, column=0, columnspan=2, sticky="w", padx=14, pady=8)
+        ttk.Label(window, text="GIF resolution:").grid(row=10, column=0, sticky="w", padx=14, pady=5)
+        ttk.Combobox(
+            window,
+            textvariable=animation_gif_resolution_var,
+            values=[format_gif_resolution(size) for size in GIF_RESOLUTION_OPTIONS],
+            width=12,
+            state="readonly",
+        ).grid(row=10, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(
+            window,
+            text=f"Animated GIF uses {GIF_FPS} FPS and supports durations of {GIF_MIN_SECONDS}–{GIF_MAX_SECONDS} seconds. All 13 standard GIF resolutions are available.",
+            justify="left",
+        ).grid(row=11, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 8))
+
+        def start_animation():
+            try:
+                duration = int(duration_var.get())
+                fps = int(fps_var.get())
+                zoom = float(zoom_var.get())
+                x_ratio = float(target_x_var.get()) / 100.0
+                y_ratio = float(target_y_var.get()) / 100.0
+                rotation_degrees = int(rotation_var.get())
+                rotation_direction = rotation_direction_var.get()
+                animation_codec = animation_codec_var.get()
+                animation_bitrate_kbps = VIDEO_DEFAULT_BITRATE_KBPS
+                if not 1 <= duration <= 60 or fps not in VIDEO_FPS_OPTIONS or not 1 < zoom <= 10000:
+                    raise ValueError("Check duration, frame rate and zoom factor.")
+                if not 0 <= rotation_degrees <= VIDEO_MAX_ROTATION_DEGREES or rotation_direction not in ("Clockwise", "Counterclockwise"):
+                    raise ValueError("Check the rotation angle and direction.")
+                if not (0 <= x_ratio <= 1 and 0 <= y_ratio <= 1):
+                    raise ValueError("Target position percentages must be between 0 and 100.")
+                width, height, depth, pixel_size = self.read_settings()
+                if width is None:
+                    return
+                if width * height > VIDEO_MAX_PIXELS:
+                    raise ValueError("Animation export is limited to 4K (8,294,400 pixels per frame). Choose a smaller resolution.")
+                filename = (
+                    f"{self.current_fractal_type.lower().replace(' ', '_')}_zoom_{zoom:g}x_"
+                    f"rotate_{rotation_degrees}_{rotation_direction.lower()}_"
+                    f"{normalize_video_codec(animation_codec)}_{animation_bitrate_kbps // 1000}mbit_"
+                    f"{duration}s_{fps}fps.mp4"
+                )
+                output_path = filedialog.asksaveasfilename(parent=window, title=f"Save {animation_codec} fractal animation", initialfile=filename, defaultextension=".mp4", filetypes=[("MP4 video (H.264 / H.265)", "*.mp4")])
+                if not output_path:
+                    return
+                state = dict(self.current_fractal_view_state)
+                fractal_type = self.current_fractal_type
+                bilinear = bool(self.bilinear_var.get())
+                rendering_mode = self.rendering_mode_var.get()
+                window.destroy()
+                self._start_fractal_animation_export(
+                    output_path, width, height, depth, pixel_size, bilinear,
+                    fractal_type, state, duration, fps, zoom, x_ratio, y_ratio,
+                    rendering_mode, rotation_degrees, rotation_direction,
+                    animation_codec, animation_bitrate_kbps,
+                )
+            except Exception as exc:
+                messagebox.showerror("Animation settings", str(exc), parent=window)
+
+        def start_gif_animation():
+            try:
+                duration = int(duration_var.get())
+                zoom = float(zoom_var.get())
+                x_ratio = float(target_x_var.get()) / 100.0
+                y_ratio = float(target_y_var.get()) / 100.0
+                rotation_degrees = int(rotation_var.get())
+                rotation_direction = rotation_direction_var.get()
+                gif_resolution = normalize_gif_resolution(animation_gif_resolution_var.get())
+                if not GIF_MIN_SECONDS <= duration <= GIF_MAX_SECONDS:
+                    raise ValueError(
+                        f"Animated GIF duration must be between {GIF_MIN_SECONDS} and "
+                        f"{GIF_MAX_SECONDS} seconds. Reduce the duration before exporting GIF."
+                    )
+                if not 1 < zoom <= 10000:
+                    raise ValueError("Zoom factor must be greater than 1 and no more than 10,000.")
+                if not 0 <= rotation_degrees <= VIDEO_MAX_ROTATION_DEGREES:
+                    raise ValueError("Rotation angle must be between 0 and 720 degrees.")
+                if rotation_direction not in ("Clockwise", "Counterclockwise"):
+                    raise ValueError("Choose a valid rotation direction.")
+                if not (0 <= x_ratio <= 1 and 0 <= y_ratio <= 1):
+                    raise ValueError("Target position percentages must be between 0 and 100.")
+                settings = self.read_settings()
+                if settings is None:
+                    return
+                _width, _height, depth, pixel_size = settings
+                state = dict(self.current_fractal_view_state)
+                fractal_type = self.current_fractal_type
+                bilinear = bool(self.bilinear_var.get())
+                rendering_mode = self.rendering_mode_var.get()
+                gif_width, gif_height = gif_resolution
+                filename = (
+                    f"{fractal_type.lower().replace(' ', '_')}_zoom_{zoom:g}x_"
+                    f"{gif_width}x{gif_height}_{duration}s_{GIF_FPS}fps.gif"
+                )
+                output_path = filedialog.asksaveasfilename(
+                    parent=window,
+                    title="Save animated fractal GIF",
+                    initialfile=filename,
+                    defaultextension=".gif",
+                    filetypes=[("Animated GIF", "*.gif")],
+                )
+                if not output_path:
+                    return
+                window.destroy()
+                self._start_fractal_animation_gif_export(
+                    output_path, gif_width, gif_height, depth, pixel_size,
+                    bilinear, fractal_type, state, duration, zoom,
+                    x_ratio, y_ratio, rendering_mode,
+                    rotation_degrees, rotation_direction,
+                )
+            except Exception as exc:
+                messagebox.showerror("GIF animation settings", str(exc), parent=window)
+
+        buttons = ttk.Frame(window, padding=12)
+        buttons.grid(row=12, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Export GIF", command=start_gif_animation).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Export MP4", command=start_animation).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right", padx=4)
+
+    def _start_fractal_animation_gif_export(
+        self, output_path, width, height, depth, pixel_size, bilinear,
+        fractal_type, view_state, duration, zoom, target_x, target_y,
+        rendering_mode, rotation_degrees=0, rotation_direction="Clockwise",
+    ):
+        self.is_exporting_animation = True
+        animation_cancel_control = VideoExportControl()
+        self.active_video_export_control = animation_cancel_control
+        self.current_animation_format = "GIF"
+        self.current_animation_gif_resolution = (int(width), int(height))
+        self.current_animation_frames = int(duration) * GIF_FPS
+        self.current_animation_duration = int(duration)
+        self.current_animation_fps = GIF_FPS
+        self._set_action_buttons()
+        self.progress.configure(maximum=self.current_animation_frames, value=0)
+        self.progress.pack(fill="x", padx=12, pady=(0, 5))
+        self.status_var.set(
+            f"Preparing fractal GIF: {fractal_type}, {width}×{height}, "
+            f"{duration}s at {GIF_FPS} FPS..."
+        )
+        threading.Thread(
+            target=self._animation_gif_worker,
+            args=(
+                output_path, width, height, depth, pixel_size, bilinear,
+                fractal_type, view_state, duration, zoom, target_x, target_y,
+                rendering_mode, rotation_degrees, rotation_direction,
+                animation_cancel_control,
+            ),
+            daemon=True,
+        ).start()
+
+    def _animation_gif_worker(
+        self, output_path, width, height, depth, pixel_size, bilinear,
+        fractal_type, view_state, duration, zoom, target_x, target_y,
+        rendering_mode, rotation_degrees=0, rotation_direction="Clockwise",
+        cancel_control=None,
+    ):
+        try:
+            if cancel_control is not None:
+                cancel_control.check()
+
+            def report_progress(frame_number):
+                self.animation_queue.put(("gif_progress", frame_number))
+
+            self.animation_queue.put(("gif_status", "Preparing shared GIF color palette..."))
+            result = encode_fractal_zoom_animation_gif(
+                output_path, width, height, depth, fractal_type, view_state,
+                duration_seconds=duration,
+                zoom_factor=zoom,
+                target_x=target_x,
+                target_y=target_y,
+                pixel_size=pixel_size,
+                bilinear=bilinear,
+                rendering_mode=rendering_mode,
+                progress_callback=report_progress,
+                rotation_degrees=rotation_degrees,
+                rotation_direction=rotation_direction,
+                resolution=(width, height),
+                cancel_control=cancel_control,
+            )
+            if cancel_control is not None:
+                cancel_control.check()
+            self.animation_queue.put(("gif_success", output_path, result))
+        except VideoExportCancelled:
+            removed, cleanup_error = _remove_incomplete_video_file(output_path)
+            self.animation_queue.put(("gif_cancelled", output_path, removed, cleanup_error))
+        except Exception as exc:
+            if cancel_control is not None and cancel_control.cancelled:
+                removed, cleanup_error = _remove_incomplete_video_file(output_path)
+                self.animation_queue.put(("gif_cancelled", output_path, removed, cleanup_error))
+            else:
+                _remove_incomplete_video_file(output_path)
+                self.animation_queue.put(("gif_error", str(exc)))
+
+    def _start_fractal_animation_export(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS):
+        self.is_exporting_animation = True
+        animation_cancel_control = VideoExportControl()
+        self.active_video_export_control = animation_cancel_control
+        self.current_animation_format = "MP4"
+        self.current_animation_video_codec = video_codec
+        self.current_animation_bitrate_kbps = int(bitrate_kbps)
+        self.current_animation_frames = int(duration) * int(fps)
+        self.current_animation_duration = int(duration)
+        self.current_animation_fps = int(fps)
+        self._set_action_buttons()
+        self.progress.configure(maximum=self.current_animation_frames, value=0)
+        self.progress.pack(fill="x", padx=12, pady=(0, 5))
+        self.status_var.set(f"Preparing {fractal_type} zoom animation: {width}×{height}, {duration}s at {fps} FPS...")
+        threading.Thread(
+            target=self._animation_worker,
+            args=(output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees, rotation_direction, video_codec, bitrate_kbps, animation_cancel_control),
+            daemon=True,
+        ).start()
+
+    def _animation_worker(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS, cancel_control=None):
+        try:
+            if cancel_control is not None:
+                cancel_control.check()
+            def report_progress(frame_number):
+                self.animation_queue.put(("progress", frame_number))
+            result = encode_fractal_zoom_animation(
+                output_path, width, height, depth, fractal_type, view_state,
+                duration_seconds=duration, fps=fps, zoom_factor=zoom,
+                target_x=target_x, target_y=target_y, pixel_size=pixel_size,
+                bilinear=bilinear, rendering_mode=rendering_mode,
+                progress_callback=report_progress,
+                rotation_degrees=rotation_degrees,
+                rotation_direction=rotation_direction,
+                video_codec=video_codec,
+                bitrate_kbps=bitrate_kbps,
+                cancel_control=cancel_control,
+            )
+            if cancel_control is not None:
+                cancel_control.check()
+            self.animation_queue.put(("success", output_path, result))
+        except VideoExportCancelled:
+            removed, cleanup_error = _remove_incomplete_video_file(output_path)
+            self.animation_queue.put(("cancelled", output_path, removed, cleanup_error))
+        except Exception as exc:
+            if cancel_control is not None and cancel_control.cancelled:
+                removed, cleanup_error = _remove_incomplete_video_file(output_path)
+                self.animation_queue.put(("cancelled", output_path, removed, cleanup_error))
+            else:
+                self.animation_queue.put(("error", str(exc)))
+
+    def _poll_animation_result(self):
+        try:
+            while True:
+                item = self.animation_queue.get_nowait()
+                if item[0] == "progress":
+                    if self.active_video_export_control is not None and self.active_video_export_control.cancelled:
+                        continue
+                    frame_number = item[1]
+                    self.progress.configure(value=frame_number)
+                    self.status_var.set(f"Rendering fractal animation: frame {frame_number}/{self.current_animation_frames} ({frame_number / self.current_animation_fps:.1f}/{self.current_animation_duration}s)")
+                elif item[0] == "gif_status":
+                    if self.active_video_export_control is None or not self.active_video_export_control.cancelled:
+                        self.status_var.set(item[1])
+                elif item[0] == "gif_progress":
+                    if self.active_video_export_control is not None and self.active_video_export_control.cancelled:
+                        continue
+                    frame_number = item[1]
+                    self.progress.configure(value=frame_number)
+                    self.status_var.set(
+                        f"Rendering fractal GIF: frame {frame_number}/{self.current_animation_frames} "
+                        f"({frame_number / GIF_FPS:.1f}/{self.current_animation_duration}s)"
+                    )
+                elif item[0] == "gif_success":
+                    _, output_path, render_info = item
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.configure(value=self.current_animation_frames)
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    self.status_var.set(
+                        f"Saved fractal animation GIF ({render_info['width']}×{render_info['height']}): {output_path}"
+                    )
+                    messagebox.showinfo(
+                        "Fractal GIF complete",
+                        f"Your {render_info['duration_seconds']}-second animated fractal GIF has been saved.\n\n"
+                        f"Resolution: {render_info['width']} × {render_info['height']}\n"
+                        f"Frame rate: {render_info['fps']} FPS\n"
+                        f"Frames: {render_info['frames']}\n"
+                        f"Fractal renderer: {render_info.get('backend', 'Renderer')}\n\n"
+                        + output_path,
+                    )
+                elif item[0] == "gif_cancelled":
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.configure(value=0)
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    removed = item[2] if len(item) > 2 else not os.path.exists(item[1])
+                    cleanup_error = item[3] if len(item) > 3 else None
+                    if removed:
+                        self.status_var.set("Fractal GIF export cancelled. Incomplete GIF deleted.")
+                    else:
+                        self.status_var.set("Fractal GIF cancelled, but the incomplete GIF could not be deleted.")
+                        messagebox.showwarning(
+                            "Incomplete GIF could not be deleted",
+                            "The GIF export was cancelled, but Windows still has the incomplete file locked. "
+                            "Close any application using it and delete it manually.\n\n"
+                            f"File: {item[1]}\nReason: {cleanup_error or 'File is still in use.'}",
+                        )
+                elif item[0] == "gif_error":
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    self.status_var.set("Fractal GIF export failed.")
+                    messagebox.showerror("Fractal GIF failed", item[1])
+                elif item[0] == "success":
+                    _, output_path, render_info = item
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.configure(value=self.current_animation_frames)
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    backend = render_info.get("backend", "Renderer")
+                    codec_label = render_info.get("codec", video_codec_label(self.video_codec_var.get()))
+                    encoder_label = render_info.get("encoder_label", f"{codec_label} encoder")
+                    self.status_var.set(
+                        f"Saved {codec_label} fractal animation ({backend}; {encoder_label}): {output_path}"
+                    )
+                    encoder_note = (
+                        f"\n\nNVENC was unavailable, so the CPU encoder for {codec_label} was used:\n"
+                        + str(render_info.get("encoder_fallback_reason"))
+                        if render_info.get("encoder_fallback_reason") else ""
+                    )
+                    messagebox.showinfo(
+                        "Fractal animation complete",
+                        f"Your {self.current_animation_duration}-second, {self.current_animation_fps}-FPS "
+                        f"{codec_label} fractal zoom animation has been saved.\n\n"
+                        f"Target bitrate: {self.current_animation_bitrate_kbps // 1000} Mbit/s\n"
+                        f"Fractal renderer: {backend}\nVideo encoder: {encoder_label}\n\n"
+                        + output_path + encoder_note,
+                    )
+                elif item[0] == "cancelled":
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.configure(value=0)
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    removed = item[2] if len(item) > 2 else not os.path.exists(item[1])
+                    cleanup_error = item[3] if len(item) > 3 else None
+                    if removed:
+                        self.status_var.set("Fractal animation cancelled. Incomplete MP4 deleted.")
+                    else:
+                        self.status_var.set("Fractal animation cancelled, but the incomplete MP4 could not be deleted.")
+                        messagebox.showwarning(
+                            "Incomplete video could not be deleted",
+                            "The animation was cancelled, but Windows still has the incomplete file locked. "
+                            "Close any application using it and delete it manually.\n\n"
+                            f"File: {item[1]}\nReason: {cleanup_error or 'File is still in use.'}",
+                        )
+                elif item[0] == "error":
+                    self.is_exporting_animation = False
+                    self.active_video_export_control = None
+                    self.progress.pack_forget()
+                    self._set_action_buttons()
+                    self.status_var.set("Fractal animation export failed.")
+                    messagebox.showerror("Fractal animation failed", item[1])
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_animation_result)
+
     def _set_action_buttons(self):
-        busy = self.is_generating or self.is_exporting_video or self.is_exporting_gif
+        busy = (self.is_generating or self.is_exporting_video or self.is_exporting_gif
+                or self.is_batch_generating or self.is_exporting_animation)
         self.generate_button.configure(state="disabled" if busy else "normal")
         self.fractal_button.configure(state="disabled" if busy else "normal")
         self.fractal_type_combo.configure(state="disabled" if busy else "readonly")
@@ -3970,15 +7218,35 @@ class RandomPixelGenerator:
                 state="normal" if self.current_image_type == "fractal" and self.current_fractal_view_state and not busy else "disabled"
             )
         self.video_button.configure(state="disabled" if busy else "normal")
+        export_active = bool(self.is_exporting_video or self.is_exporting_animation)
+        if export_active:
+            if not self.cancel_video_button.winfo_manager():
+                self.cancel_video_button.pack(side="left", padx=6, before=self.gif_button)
+            cancelling = bool(
+                self.active_video_export_control is not None
+                and self.active_video_export_control.cancelled
+            )
+            self.cancel_video_button.configure(
+                text="Cancelling..." if cancelling else "Cancel Export",
+                state="disabled" if cancelling else "normal",
+            )
+        else:
+            self.cancel_video_button.pack_forget()
+            self.cancel_video_button.configure(text="Cancel Export", state="disabled")
+        self.video_codec_combo.configure(state="disabled" if busy else "readonly")
         self.gif_button.configure(state="disabled" if busy else "normal")
         self.duration_scale.configure(state="disabled" if busy else "normal")
         self.fps_scale.configure(state="disabled" if busy else "normal")
+        self.rotation_scale.configure(state="disabled" if busy else "normal")
+        self.rotation_direction_combo.configure(state="disabled" if busy else "readonly")
         self.gif_duration_scale.configure(state="disabled" if busy else "normal")
         self.gif_resolution_combo.configure(state="disabled" if busy else "readonly")
         self.resolution_combo.configure(state="disabled" if busy else "readonly")
         self.pixel_size_scale.configure(state="disabled" if busy else "normal")
         self.depth_combo.configure(state="disabled" if busy else "readonly")
         self.bilinear_check.configure(state="disabled" if busy else "normal")
+        if hasattr(self, "fractal_tools_menu_button"):
+            self.fractal_tools_menu_button.configure(state="disabled" if busy else "normal")
         self.save_button.configure(
             state="normal" if self.image is not None and not busy else "disabled"
         )
