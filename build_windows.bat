@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==============================================
-echo Pixel Generator - Numba + OpenCL GPU Fractal Edition
+echo Pixel Generator - H.264 / H.265 + OpenCL + NVENC Edition
 echo ==============================================
 
 where py >nul 2>nul
