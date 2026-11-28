@@ -1,3 +1,5 @@
+Main-window layout update: the Image rotation slider is positioned to the left of the Rotation direction selector. The direction selector height is synchronized to the slider height and re-synchronized when the application theme changes.
+
 Random Pixel Image, Fractal, GIF & OpenCL-Accelerated H.264 / H.265 Video Generator — Windows Build
 
 Features
@@ -6,12 +8,12 @@ Features
 - Theme changes apply immediately without restarting the application; Nord Dark is the default
 - Selected theme is remembered between launches in a separate per-user theme_preference.json settings file
 - Themed ttk controls, menus, classic Tk sliders, preview canvas and About hyperlink follow the active palette
-- Themes menu is positioned immediately to the left of About at the far-right side of the application menu bar; About remains the rightmost menu and displays: Pixel Generator V1.1
+- Themes menu is positioned immediately to the left of About at the far-right side of the application menu bar; About remains the rightmost menu and displays: Pixel Generator V1.5
 - The About window includes a clickable GitHub project link that opens https://github.com/KastriotH/pixel-generator in the default web browser
 - Default image size: 1920 × 1080
 - Default color depth: 1 bit (pure black and pure white)
 - Color depth selector offers exactly six choices: 1, 2, 4, 8, 16 and 24 bits; choosing a depth automatically generates a new image at that depth
-- 1, 2, 4 and 8-bit images use random RGB palettes; 1-bit mode is exactly black and white
+- 1, 2, 4 and 8-bit images use indexed palettes; 1-bit defaults to black and white, while 2/4-bit retain randomized palettes unless a custom palette is applied
 - 16-bit and 24-bit images use direct RGB color with the selected number of bits distributed across red, green and blue
 - 24-bit mode is full RGB888 color with up to 16,777,216 possible colors
 - Resolution dropdown replaces the separate X/Y fields and offers 53 practical presets grouped as 4:3, 16:9 and 21:9-class ultrawide
@@ -23,23 +25,23 @@ Features
 - The preset list includes common sizes from compact resolutions through 8K-class output; mathematically possible resolutions are unlimited, so the dropdown uses a curated set of practical presets. Common ultrawide monitor modes are included in the 21:9 class even where panel timings are slightly wider or narrower than an exact 7:3 ratio
 - Image preview and PNG export use the selected resolution
 - The resolution dropdown and a wide 750-pixel pixel-doubling slider share the top control row
-- Generate Random Image, Generate Random Fractal, Save PNG, Export Video and Export GIF controls appear first on the lower control row, followed by the color-depth selector and the Bilinear filtering switch
+- Generate Random Image, Generate Random Fractal, Save PNG, Export Video and Export GIF controls appear first on the lower control row, followed by the color-depth selector, Screen effect dropdown and Apply Effect button
 - Generate Random Fractal button uses an adjacent Fractal type dropdown with seven families: Mandelbrot, Julia Set, Burning Ship, Tricorn (Mandelbar), Multibrot (Power 3), Celtic Mandelbrot and Phoenix; Mandelbrot remains the default
 - Each fractal generation randomizes the view center, zoom level and color-cycle mapping; Julia and Phoenix also randomize their defining complex parameters; some generations show broader overviews while others explore detailed regions
-- Fractals honor the selected 1–24-bit color depth and use the current pixel-block and bilinear preview settings
+- Fractals honor the selected 1–24-bit color depth and use the current pixel-block and applied screen-effect settings
 - Changing the fractal type while viewing a fractal regenerates immediately; changing color depth or resolution also regenerates the currently selected fractal family
 - Fractal renderer offers three modes: Automatic (benchmarks CPU vs OpenCL GPU), CPU (Numba multi-threaded), and GPU (OpenCL); the selected mode is remembered between launches
 - Automatic mode benchmarks the selected fractal family at a representative resolution, caches the CPU/GPU decision by device/driver, CPU configuration, fractal family and selected output resolution, and prefers CPU when results are within 3%
 - GPU mode uses PyOpenCL and the NVIDIA OpenCL driver; Automatic mode falls back to Numba CPU if no compatible OpenCL GPU is found or GPU initialization fails
 - OpenCL GPU kernels use double precision for the fractal escape-time iteration; GPU computation is row-chunked to bound temporary memory and the existing color/palette pipeline is shared with CPU output
 - Fractal families use escape-time equations: Mandelbrot (z²+c), Julia Set (z²+c with a randomized complex constant), Burning Ship (absolute real/imaginary components before squaring), Tricorn/Mandelbar (conjugate iteration), cubic Multibrot (z³+c), Celtic Mandelbrot (absolute real component of z²) and Phoenix (quadratic recurrence with a prior-iteration term)
-- All fractal families support the same six color depths, pixel-doubling preview and bilinear filtering controls, and PNG export
+- All fractal families support the same six color depths, pixel-doubling preview and screen effects, and PNG export
 - Fast NumPy-based random pixel generation
 - Pixel doubling slider: square pixel blocks from 1×1 to 32×32 for still images and video
 - Moving the pixel doubling slider updates the image preview immediately; no regeneration button is needed
-- Interactive Bilinear filtering switch toggles between sharp pixel blocks and smooth bilinear interpolation; no secondary mode caption is shown beside the switch
-- Bilinear mode updates the preview immediately and is also used for PNG and H.264/AVC or H.265/HEVC video output
-- Bilinear interpolation blends neighboring colors and can introduce intermediate shades beyond the selected source color depth
+- Screen effect dropdown includes blur, sharpen, posterize, grayscale, sepia, invert, edge detection, emboss, high contrast, vignette and vintage effects
+- Apply Effect refreshes the current preview; Save PNG and all video/GIF export paths use the applied effect
+- Choosing a different dropdown value does not change the current image until Apply Effect is pressed
 - The application remembers the main window position between launches
 - Window position is saved automatically after moving the window and when closing the application, in the current user profile
 - Exact output dimensions are preserved; partial blocks are clipped at non-divisible edges
@@ -48,18 +50,18 @@ Features
 - OpenCL random-video rendering synthesizes fresh random pixel patterns and applies the progressive 0–720° rotation together in a single GPU kernel, then transfers small frame batches to FFmpeg for H.264/AVC or H.265/HEVC encoding
 - OpenCL video batches are memory-bounded (approximately 32 MB per batch, maximum four frames) to keep 1080p and 4K exports within practical GPU memory use
 - Fractal Animation Studio applies video rotation with OpenCL when the selected fractal renderer is GPU; CPU mode continues to use FFmpeg
-- Fractal Animation Studio can also export an animated fractal GIF alongside MP4; it reuses the current fractal family, saved viewport and complex parameters, custom palette, zoom target, pixel size, bilinear setting and 0–720° rotation
+- Fractal Animation Studio can also export an animated fractal GIF alongside MP4; it reuses the current fractal family, saved viewport and complex parameters, custom palette, zoom target, pixel size, applied screen effect and 0–720° rotation
 - Fractal Animation Studio GIF export includes a dedicated resolution dropdown with exactly the same 13 presets as the normal GIF exporter; its selected resolution is applied to the actual fractal rendering and every saved GIF frame
 - Fractal Animation Studio GIFs use the standard GIF timing: 30 FPS and 1–30 seconds, regardless of the MP4 frame-rate selector; a shared palette is sampled from the animation to keep colors stable
 - Video codec selector offers H.264/AVC and H.265/HEVC. H.265/HEVC is the default to preserve the previous export behavior.
 - Bitrate-controlled H.264/AVC and H.265/HEVC exports use a fixed 200 Mbit/s target. Fresh random-image video at 1×1 automatically switches to codec-specific Constant Quality Mode. H.264 NVENC uses VBR-CQ 12; H.265 NVENC uses VBR-CQ 20 with a 200 Mbit/s ceiling. The CPU H.264 fallback uses QP 12; the CPU H.265 fallback uses CRF 20 with a 200 Mbit/s VBV ceiling. Both codecs encode 1×1 frames as intra-only.
 - H.264/AVC prefers NVIDIA h264_nvenc and falls back to CPU libx264 when NVENC is unavailable; H.265/HEVC prefers NVIDIA hevc_nvenc and falls back to CPU libx265. Each codec has an independent runtime encoder probe and fallback cache.
 - OpenCL accelerates random-frame generation and image rotation; NVENC accelerates video compression when available. If NVENC cannot initialize, CPU software encoding remains available.
-- Animated GIF export button follows Export Video; the color-depth selector is placed immediately before the Bilinear filtering switch
+- Animated GIF export button follows Export Video; the color-depth selector is followed by the Screen effect dropdown and Apply Effect button
 - GIF export offers 13 selectable preset resolutions: 32 × 24, 64 × 48, 96 × 64, 128 × 96, 160 × 128, 256 × 192, 320 × 200, 192 × 108, 384 × 216, 400 × 300, 512 × 384, 640 × 360 and 640 × 480; the default remains 384 × 216
 - GIF duration slider provides 30 whole-second positions (1–30 seconds), defaults to 5 seconds and sits alongside the video duration and frame-rate controls; the selected GIF duration determines the total frame count (30 frames per second)
 - GIF resolution is selected independently from the 13-item preset dropdown; the chosen width and height are applied to every generated frame and verified in the saved GIF
-- GIF frames use the current color depth, pixel-doubling and bilinear settings, with a fresh random pattern for each frame
+- GIF frames use the current color depth, pixel-doubling and applied screen effect, with a fresh random pattern for each frame
 - GIF output uses a shared 256-color palette across frames for stable playback; GIF itself is limited to 256 colors per frame
 - GIF timing uses 30 ms and 40 ms frame delays (GIF stores centisecond delays), distributed across the selected frame count to total the exact selected whole-second duration
 - Video duration: 1–60 seconds
@@ -154,12 +156,12 @@ Fractal Workspace features
 --------------------------
 The Fractal Tools menu adds five creative-workflow upgrades:
 
-- Fractal bookmarks: save a named fractal view and restore its fractal family, complex parameters, exact center/zoom, image dimensions, color depth, pixel-block size, bilinear setting and custom palette. Manage bookmarks to load or delete them.
+- Fractal bookmarks: save a named fractal view and restore its fractal family, complex parameters, exact center/zoom, image dimensions, color depth, pixel-block size, applied screen effect and custom palette. Manage bookmarks to load or delete them.
 - Undo/Redo navigation: mouse-wheel zoom, click-and-drag panning, Reset View and palette changes are tracked in a 100-step history. Ctrl+Z and Ctrl+Y navigate backward and forward through the current fractal session.
 - Fractal Gallery: new fractal generations are automatically saved as PNG plus JSON metadata by default. Automatic saving can be toggled from Fractal Tools. The gallery keeps the newest 250 entries; users can load, delete or open the gallery folder. Pan/zoom redraws are not automatically duplicated as new gallery entries.
 - Custom color palettes: create named gradients with 2–16 hexadecimal color stops, add/edit/remove stops using the color picker, save and apply palettes, or return to the built-in Random spectrum. Custom gradients are applied in both Numba CPU and OpenCL GPU rendering paths and are retained in bookmarks, gallery metadata and batch outputs.
 - Batch fractal generation: generate 100 or 1,000 images, selecting a specific fractal family or randomizing across all seven. Each output is a PNG with a matching JSON file containing the fractal coordinates, family, palette and render settings. Batch jobs show progress and can be cancelled; optional gallery auto-save follows the gallery preference.
-- Fractal Animation Studio: render an H.264/AVC or H.265/HEVC MP4 zoom journey from the current fractal view toward a selected target point. Choose a 1–60 second duration, 30/60/120 FPS, zoom factor, target X/Y position, 0–720° rotation and rotation direction. The fractal zoom and rotation happen together. It uses the selected CPU/GPU/Automatic rendering mode and preserves the current fractal family, complex parameters and custom palette, along with selected pixel doubling and bilinear filtering. MP4 output is limited to 4K (8,294,400 pixels per frame).
+- Fractal Animation Studio: render an H.264/AVC or H.265/HEVC MP4 zoom journey from the current fractal view toward a selected target point. Choose a 1–60 second duration, 30/60/120 FPS, zoom factor, target X/Y position, 0–720° rotation and rotation direction. The fractal zoom and rotation happen together. It uses the selected CPU/GPU/Automatic rendering mode and preserves the current fractal family, complex parameters and custom palette, along with selected pixel doubling and the applied screen effect. MP4 output is limited to 4K (8,294,400 pixels per frame).
 - Fractal Animation Studio also has an Export GIF action. Select one of the same 13 GIF output resolutions as the main GIF exporter (32×24 through 640×480). The animated GIF follows the studio's current fractal zoom, target, rotation, pixel size, palette and renderer; GIF output is fixed at 30 FPS and supports 1–30 seconds. It uses a shared sampled palette and preserves the requested frame count, including duplicate frames.
 
 Fractal Workspace data is stored under the per-user application directory:
@@ -169,7 +171,7 @@ Fractal Workspace data is stored under the per-user application directory:
 - Gallery\ contains auto-saved and manually retained PNG/JSON gallery entries.
 - gallery_settings.json stores the gallery auto-save preference.
 
-Workspace tools require no additional third-party dependencies beyond the application requirements. The animation studio and rotating-image export use the shared FFmpeg codec selection. The OpenCL video kernels are embedded in the Python source and are compiled by the installed graphics driver on first use. The regular Export Video button generates fresh random frames (using the selected color depth, pixel size and bilinear setting) when the current source is a random image. When the current source is a fractal, it rotates a snapshot of the current fractal preview. OpenCL performs random frame generation and rotation together when GPU or Automatic selects an available device; CPU mode uses FFmpeg's threaded rotation filter. FFmpeg encodes either H.264/AVC or H.265/HEVC. NVIDIA h264_nvenc/hevc_nvenc is preferred when its runtime probe succeeds, falling back to CPU libx264/libx265 when unavailable. Its rotate filter uses positive angles for visually clockwise rotation (opposite Pillow), and the regression suite checks decoded frame orientation for both directions.
+Workspace tools require no additional third-party dependencies beyond the application requirements. The animation studio and rotating-image export use the shared FFmpeg codec selection. The OpenCL video kernels are embedded in the Python source and are compiled by the installed graphics driver on first use. The regular Export Video button generates fresh random frames (using the selected color depth, pixel size and applied screen effect) when the current source is a random image. When the current source is a fractal, it rotates a snapshot of the current fractal preview. OpenCL performs random frame generation and rotation together when GPU or Automatic selects an available device; CPU mode uses FFmpeg's threaded rotation filter. FFmpeg encodes either H.264/AVC or H.265/HEVC. NVIDIA h264_nvenc/hevc_nvenc is preferred when its runtime probe succeeds, falling back to CPU libx264/libx265 when unavailable. Its rotate filter uses positive angles for visually clockwise rotation (opposite Pillow), and the regression suite checks decoded frame orientation for both directions.
 
 Regression tests
 ----------------
@@ -314,7 +316,7 @@ fractal rendering, not just post-export scaling.
 GIF animation uses 30 FPS (GIF centisecond timing) and supports 1–30 seconds,
 independent of the MP4 frame-rate selector. The animation follows the current
 fractal family, viewport, zoom factor, target X/Y, complex parameters, palette,
-pixel size, bilinear setting and rotation angle/direction. A representative
+pixel size, the applied screen effect and rotation angle/direction. A representative
 set of frames builds one shared 256-color palette for stable color mapping;
 every requested frame is kept in the output, including duplicates.
 
@@ -324,3 +326,36 @@ cancellation still terminates FFmpeg and cleans up the partial MP4.
 
 Regression coverage: test_fractal_animation_gif.py and
 test_fractal_animation_gif_ui.py.
+
+MOUSE-WHEEL PIXEL DOUBLING
+--------------------------
+In Render Pixel mode, move the pointer over the displayed image and use the
+mouse wheel to adjust Pixel doubling: wheel up increases the setting by one
+step, and wheel down decreases it by one step, bounded from 1x1 to 32x32.
+On high-resolution Windows wheels, multiple reported notches are applied.
+Scrolling outside the displayed image does not change the setting. During
+generation or export, wheel adjustments are ignored. Fractal mode retains its
+existing mouse-wheel zoom behavior. The same control supports Linux Button-4
+(up) and Button-5 (down) wheel events.
+
+Regression coverage: test_pixel_size_mousewheel.py
+
+Palette Apply behavior fix (2026-11-28): Applying/saving a low-bit palette while in Fractal Generator now refreshes the active fractal view and stays in Fractal Generator. In Random Pixel Generator mode, it still refreshes the random image.
+
+SCREEN EFFECTS (2026-11-28)
+--------------------------
+The former Bilinear filtering checkbox has been replaced by a Screen effect
+selector and an Apply Effect button. Available effects are None, Gaussian Blur,
+Soft Blur, Sharpen, Strong Sharpen, Posterize, Grayscale, Sepia, Invert, Edge
+Detect, Emboss, High Contrast, Vignette and Vintage.
+
+Applying an effect updates the active preview while preserving the original
+source image for future pixel-size changes. The processed result is saved by
+Save PNG. The same selected effect is applied to every frame in the main random
+GIF and random video exporters, and to the Fractal Animation Studio GIF/MP4
+renderers. For a rotating fractal snapshot video, the already-processed preview
+is used as the source, so the effect remains visible throughout the rotation.
+Effects are applied only after pressing Apply Effect; changing the dropdown by
+itself does not alter the current image or exports.
+
+Regression coverage: test_screen_effects.py

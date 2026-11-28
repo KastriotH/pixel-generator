@@ -21,7 +21,7 @@ import imageio_ffmpeg
 import numba
 import numpy as np
 from numba import njit, prange
-from PIL import GifImagePlugin, Image, ImageColor, ImageTk
+from PIL import GifImagePlugin, Image, ImageColor, ImageEnhance, ImageFilter, ImageOps, ImageTk
 
 try:
     import pyopencl as cl
@@ -414,6 +414,48 @@ def get_custom_palettes_path():
 
 def get_active_palette_path():
     return os.path.join(get_fractal_workspace_dir(), "active_palette.json")
+
+
+def get_low_bit_palettes_path():
+    return os.path.join(get_fractal_workspace_dir(), "low_bit_palettes.json")
+
+LOW_BIT_PALETTE_PRESETS = {
+    "Black & White": {1: ["#000000", "#FFFFFF"], 2: ["#000000", "#555555", "#AAAAAA", "#FFFFFF"], 4: ["#000000", "#222222", "#444444", "#666666", "#888888", "#AAAAAA", "#CCCCCC", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#00FFFF", "#FF00FF", "#FF8800", "#8800FF"]},
+    "Game Boy": {1: ["#0F380F", "#9BBC0F"], 2: ["#0F380F", "#306230", "#8BAC0F", "#9BBC0F"], 4: ["#0F380F", "#183C18", "#245024", "#306230", "#426B20", "#587A1C", "#6D8918", "#8BAC0F", "#9BBC0F", "#B4C83C", "#C8D85A", "#D8E878", "#E8F090", "#F0F8A8", "#F8FFC0", "#FFFFFF"]},
+    "Green CRT": {1: ["#001800", "#55FF55"], 2: ["#001800", "#116611", "#33CC33", "#AAFFAA"], 4: ["#001000", "#002000", "#003300", "#005500", "#007700", "#009900", "#00BB00", "#00DD00", "#22FF22", "#55FF55", "#77FF77", "#99FF99", "#BBFFBB", "#DDFFDD", "#EEFFEE", "#FFFFFF"]},
+    "Amber CRT": {1: ["#1A0800", "#FFB000"], 2: ["#1A0800", "#663300", "#CC6600", "#FFB000"], 4: ["#100400", "#220800", "#331000", "#552000", "#773300", "#994400", "#BB5500", "#DD6600", "#FF7700", "#FF8800", "#FF9900", "#FFAA00", "#FFBB33", "#FFCC66", "#FFDD99", "#FFFFCC"]},
+    "CGA": {1: ["#000000", "#FFFFFF"], 2: ["#000000", "#55FFFF", "#FF55FF", "#FFFFFF"], 4: ["#000000", "#0000AA", "#00AA00", "#00AAAA", "#AA0000", "#AA00AA", "#AA5500", "#AAAAAA", "#555555", "#5555FF", "#55FF55", "#55FFFF", "#FF5555", "#FF55FF", "#FFFF55", "#FFFFFF"]},
+    "Sepia": {1: ["#241508", "#F5DEB3"], 2: ["#241508", "#704214", "#C49A6C", "#F5DEB3"], 4: ["#160B04", "#2B1608", "#40220C", "#553010", "#6A3E14", "#804C18", "#955A20", "#AA6828", "#BF7838", "#D08A4A", "#DDA05F", "#E6B878", "#EAC894", "#EED6AA", "#F2E0BC", "#FFF4D8"]},
+    "Blue Monochrome": {1: ["#001020", "#88CCFF"], 2: ["#001020", "#003366", "#4488CC", "#CCEEFF"], 4: ["#000814", "#00152A", "#002244", "#003366", "#004488", "#0055AA", "#1166BB", "#2277CC", "#3388DD", "#4499EE", "#66AAFF", "#88BBFF", "#AADDFF", "#BBEEFF", "#DDEEFF", "#FFFFFF"]},
+}
+
+def load_low_bit_palettes(path=None):
+    path = path or get_low_bit_palettes_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cleaned = {}
+        for depth in (1, 2, 4):
+            entry = data.get(str(depth), {})
+            colors = entry.get("colors", []) if isinstance(entry, dict) else []
+            if len(colors) == (1 << depth):
+                cleaned[depth] = {"name": str(entry.get("name", "Custom")), "colors": [ImageColor.getrgb(c) for c in colors], "saved": {str(n): [ImageColor.getrgb(c) for c in palette] for n, palette in entry.get("saved", {}).items() if isinstance(palette, list) and len(palette) == (1 << depth)}}
+        return cleaned
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+def save_low_bit_palettes(palettes, path=None):
+    path = path or get_low_bit_palettes_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    serial = {str(d): {"name": e["name"], "colors": ["#%02X%02X%02X" % tuple(c) for c in e["colors"]], "saved": {n: ["#%02X%02X%02X" % tuple(c) for c in colors] for n, colors in e.get("saved", {}).items()}} for d, e in palettes.items() if d in (1, 2, 4)}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(serial, f, indent=2)
+
+def palette_for_depth(palettes, depth):
+    entry = palettes.get(int(depth)) if palettes else None
+    if entry and int(depth) in (1, 2, 4) and len(entry.get("colors", [])) == (1 << int(depth)):
+        return np.asarray(entry["colors"], dtype=np.uint8)
+    return None
 
 
 def get_gallery_directory():
@@ -2561,6 +2603,7 @@ def generate_fractal_image(
     view_state=None,
     return_view_state=False,
     custom_palette=None,
+    custom_index_palette=None,
 ):
     """Generate a randomized or user-positioned view of a fractal family.
 
@@ -2603,6 +2646,10 @@ def generate_fractal_image(
     rng = np.random.default_rng() if rng is None else rng
     if custom_palette is None and isinstance(view_state, dict):
         custom_palette = view_state.get("palette_stops")
+    if custom_index_palette is None and isinstance(view_state, dict):
+        saved_index_palette = view_state.get("custom_index_palette")
+        if saved_index_palette is not None:
+            custom_index_palette = np.asarray(saved_index_palette, dtype=np.uint8)
     custom_palette_stops = normalize_palette_stops(custom_palette) if custom_palette else None
     custom_palette_table = sample_custom_palette(custom_palette_stops, 256) if custom_palette_stops else None
 
@@ -2743,6 +2790,7 @@ def generate_fractal_image(
             "palette_phase": float(palette_phase),
             "palette_cycles": float(palette_cycles),
             "palette_stops": list(custom_palette_stops) if custom_palette_stops else None,
+            "custom_index_palette": (np.asarray(custom_index_palette, dtype=np.uint8).tolist() if custom_index_palette is not None else None),
         }
     else:
         if view_state.get("fractal_type", fractal_type) != fractal_type:
@@ -2760,12 +2808,17 @@ def generate_fractal_image(
             "center_imag": float(center_imag),
             "horizontal_span": float(horizontal_span),
             "palette_stops": list(custom_palette_stops) if custom_palette_stops else None,
+            "custom_index_palette": (np.asarray(custom_index_palette, dtype=np.uint8).tolist() if custom_index_palette is not None else None),
         })
 
 
     indexed = depth <= 8
     color_count = 1 << depth
-    if depth == 1:
+    if indexed and custom_index_palette is not None:
+        palette_rgb = np.ascontiguousarray(custom_index_palette, dtype=np.uint8)
+        if palette_rgb.shape != (color_count, 3):
+            raise ValueError(f"Custom indexed palette must have shape ({color_count}, 3).")
+    elif depth == 1:
         if custom_palette_stops:
             endpoints = sample_custom_palette(custom_palette_stops, 2)
             palette_rgb = endpoints
@@ -2897,14 +2950,16 @@ def generate_mandelbrot_image(
         rng=rng,
     )
 
-def generate_random_image(width, height, depth):
+def generate_random_image(width, height, depth, custom_palette=None):
     """Generate an indexed image (1–8 bits) or true-color RGB image (9–24 bits)."""
     depth = int(depth)
     if not 1 <= depth <= 24:
         raise ValueError("Color depth must be between 1 and 24 bits.")
 
     if depth <= 8:
-        palette = make_random_palette(depth)
+        palette = (np.asarray(custom_palette, dtype=np.uint8).tolist() if custom_palette is not None else make_random_palette(depth))
+        if len(palette) != (1 << depth):
+            raise ValueError(f"Custom palette must contain exactly {1 << depth} colors for {depth}-bit mode.")
         indices = generate_pixelated_indices(width, height, len(palette), 1)
         flat_palette = [component for color in palette for component in color]
         flat_palette.extend([0] * (768 - len(flat_palette)))
@@ -2955,6 +3010,74 @@ def pixelate_image(image, pixel_size=1, bilinear=False):
             result.putpalette(palette)
         return result
     return Image.fromarray(expanded.astype(np.uint8), mode=image.mode)
+
+
+SCREEN_EFFECT_OPTIONS = (
+    "None", "Gaussian Blur", "Soft Blur", "Sharpen", "Strong Sharpen",
+    "Posterize", "Grayscale", "Sepia", "Invert", "Edge Detect",
+    "Emboss", "High Contrast", "Vignette", "Vintage",
+)
+
+
+def apply_screen_effect(image, effect="None"):
+    """Apply one named screen effect to a PIL image without mutating its source."""
+    effect = str(effect or "None")
+    if effect not in SCREEN_EFFECT_OPTIONS:
+        raise ValueError(f"Unsupported screen effect: {effect!r}")
+    if effect == "None":
+        return image.copy()
+    rgb = image.convert("RGB")
+    if effect == "Gaussian Blur":
+        return rgb.filter(ImageFilter.GaussianBlur(radius=2.0))
+    if effect == "Soft Blur":
+        return rgb.filter(ImageFilter.GaussianBlur(radius=0.8))
+    if effect == "Sharpen":
+        return rgb.filter(ImageFilter.SHARPEN)
+    if effect == "Strong Sharpen":
+        return rgb.filter(ImageFilter.UnsharpMask(radius=2.0, percent=180, threshold=2))
+    if effect == "Posterize":
+        return ImageOps.posterize(rgb, bits=3)
+    if effect == "Grayscale":
+        return ImageOps.grayscale(rgb).convert("RGB")
+    if effect == "Sepia":
+        source = np.asarray(rgb, dtype=np.float32)
+        matrix = np.array(
+            [[0.393, 0.769, 0.189], [0.349, 0.686, 0.168], [0.272, 0.534, 0.131]],
+            dtype=np.float32,
+        )
+        return Image.fromarray(np.clip(source @ matrix.T, 0, 255).astype(np.uint8), mode="RGB")
+    if effect == "Invert":
+        return ImageOps.invert(rgb)
+    if effect == "Edge Detect":
+        return rgb.filter(ImageFilter.FIND_EDGES)
+    if effect == "Emboss":
+        return rgb.filter(ImageFilter.EMBOSS)
+    if effect == "High Contrast":
+        return ImageEnhance.Contrast(rgb).enhance(1.8)
+    if effect == "Vignette":
+        source = np.asarray(rgb, dtype=np.float32)
+        height, width = source.shape[:2]
+        y, x = np.ogrid[-1.0:1.0:complex(height), -1.0:1.0:complex(width)]
+        distance = np.sqrt((x * 0.82) ** 2 + y ** 2)
+        mask = np.clip(1.0 - 0.48 * np.maximum(0.0, distance - 0.20) ** 1.5, 0.48, 1.0)
+        result = np.clip(source * mask[..., np.newaxis], 0, 255).astype(np.uint8)
+        return Image.fromarray(result, mode="RGB")
+    if effect == "Vintage":
+        vintage = apply_screen_effect(rgb, "Sepia")
+        vintage = ImageEnhance.Color(vintage).enhance(0.72)
+        return ImageEnhance.Contrast(vintage).enhance(0.92)
+    return rgb
+
+
+def apply_screen_effect_to_rgb_array(frame, effect="None"):
+    """Apply an effect to an H×W×3 uint8 frame and return contiguous RGB."""
+    array = np.asarray(frame, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("RGB frame must have shape (height, width, 3).")
+    if str(effect or "None") == "None":
+        return np.ascontiguousarray(array)
+    image = Image.fromarray(np.ascontiguousarray(array), mode="RGB")
+    return np.ascontiguousarray(np.asarray(apply_screen_effect(image, effect), dtype=np.uint8))
 
 
 def _opencl_video_batch_size(width, height):
@@ -3334,6 +3457,8 @@ def encode_random_h264_video(
     compute_backend="CPU",
     video_codec=VIDEO_DEFAULT_CODEC,
     cancel_control=None,
+    custom_palette=None,
+    screen_effect="None",
 ):
     """Create an H.264 or H.265 MP4 with fresh random frames and optional OpenCL rotation."""
     width, height, depth = int(width), int(height), int(depth)
@@ -3379,14 +3504,14 @@ def encode_random_h264_video(
     if selected_backend == "GPU":
         # Keep the palette fixed for the whole clip, just like the CPU exporter.
         palette = np.asarray(
-            make_random_palette(depth) if depth <= 8 else [(0, 0, 0), (255, 255, 255)],
+            (custom_palette if custom_palette is not None else make_random_palette(depth)) if depth <= 8 else [(0, 0, 0), (255, 255, 255)],
             dtype=np.uint8,
         )
         frame_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
         filter_text = _ffmpeg_video_output_filter()
     else:
         palette = (
-            np.asarray(make_random_palette(depth), dtype=np.uint8)
+            np.asarray(custom_palette if custom_palette is not None else make_random_palette(depth), dtype=np.uint8)
             if depth <= 8 else None
         )
         rng = np.random.default_rng()
@@ -3438,6 +3563,11 @@ def encode_random_h264_video(
                 )
                 if cancel_control is not None:
                     cancel_control.check()
+                if screen_effect != "None":
+                    frames = np.stack([
+                        apply_screen_effect_to_rgb_array(frame, screen_effect)
+                        for frame in frames
+                    ], axis=0)
                 process.stdin.write(frames.tobytes())
                 if progress_callback:
                     progress_callback(first_frame + batch_count)
@@ -3445,10 +3575,13 @@ def encode_random_h264_video(
             for frame_number in range(1, total_frames + 1):
                 if cancel_control is not None:
                     cancel_control.check()
-                frame_bytes = generate_pixelated_frame(
+                frame = generate_pixelated_frame(
                     width, height, depth, pixel_size=pixel_size,
                     rng=rng, palette=palette, bilinear=bilinear,
-                ).tobytes()
+                )
+                if screen_effect != "None":
+                    frame = apply_screen_effect_to_rgb_array(frame, screen_effect)
+                frame_bytes = np.ascontiguousarray(frame).tobytes()
                 if cancel_control is not None:
                     cancel_control.check()
                 process.stdin.write(frame_bytes)
@@ -3887,6 +4020,7 @@ def encode_fractal_zoom_animation(
     rotation_direction="Clockwise",
     video_codec=VIDEO_DEFAULT_CODEC,
     cancel_control=None,
+    screen_effect="None",
 ):
     """Render an H.264 or H.265 zoom journey through the current fractal viewport."""
     width, height, depth = int(width), int(height), int(depth)
@@ -3965,6 +4099,7 @@ def encode_fractal_zoom_animation(
                 view_state=frame_state,
             )
             frame = pixelate_image(image, pixel_size, bilinear=bilinear).convert("RGB")
+            frame = apply_screen_effect(frame, screen_effect)
             if gpu_rotation:
                 rotated = renderer.rotate_rgb_batch(
                     np.asarray(frame, dtype=np.uint8)[np.newaxis, ...],
@@ -4137,6 +4272,8 @@ def encode_random_gif(
     progress_callback=None,
     bilinear=False,
     resolution=GIF_DEFAULT_RESOLUTION,
+    custom_palette=None,
+    screen_effect="None",
 ):
     """Export a 30-FPS random animated GIF at a preset size and selected duration."""
     depth = int(depth)
@@ -4156,7 +4293,7 @@ def encode_random_gif(
     total_duration_ms = duration_seconds * 1000
     rng = np.random.default_rng()
     palette = (
-        np.asarray(make_random_palette(depth), dtype=np.uint8)
+        np.asarray(custom_palette if custom_palette is not None else make_random_palette(depth), dtype=np.uint8)
         if depth <= 8 else None
     )
     # Keep memory predictable even at the 30-second / 900-frame maximum by
@@ -4181,7 +4318,10 @@ def encode_random_gif(
             palette=palette,
             bilinear=bilinear,
         )
-        thumbnail = Image.fromarray(np.ascontiguousarray(frame), mode="RGB").resize(
+        thumbnail_source = apply_screen_effect(
+            Image.fromarray(np.ascontiguousarray(frame), mode="RGB"), screen_effect
+        )
+        thumbnail = thumbnail_source.resize(
             (sample_width, sample_height), Image.Resampling.BOX
         )
         palette_samples.paste(thumbnail, (0, frame_index * sample_height))
@@ -4203,7 +4343,9 @@ def encode_random_gif(
                 palette=palette,
                 bilinear=bilinear,
             )
-            rgb_frame = Image.fromarray(np.ascontiguousarray(frame), mode="RGB")
+            rgb_frame = apply_screen_effect(
+                Image.fromarray(np.ascontiguousarray(frame), mode="RGB"), screen_effect
+            )
             indexed_frame = rgb_frame.quantize(
                 palette=shared_palette,
                 dither=Image.Dither.NONE,
@@ -4264,6 +4406,7 @@ def encode_fractal_zoom_animation_gif(
     rotation_direction="Clockwise",
     resolution=GIF_DEFAULT_RESOLUTION,
     cancel_control=None,
+    screen_effect="None",
 ):
     """Render a 30-FPS fractal zoom/rotation journey as an animated GIF.
 
@@ -4337,7 +4480,7 @@ def encode_fractal_zoom_animation_gif(
             rotation_degrees=rotation_degrees,
             direction=rotation_direction,
         )
-        return frame
+        return apply_screen_effect(frame, screen_effect)
 
     # Build a representative palette from evenly spaced moments in the zoom.
     # The sample render is capped at 160x120 to keep palette preparation cheap,
@@ -4458,6 +4601,10 @@ class RandomPixelGenerator:
         )
         self.bookmarks_path = get_fractal_bookmarks_path()
         self.bookmarks = load_fractal_bookmarks(self.bookmarks_path)
+        self.low_bit_palettes_path = get_low_bit_palettes_path()
+        self.low_bit_palettes = load_low_bit_palettes(self.low_bit_palettes_path)
+        if 1 not in self.low_bit_palettes:
+            self.low_bit_palettes[1] = {"name": "Black & White", "colors": [ImageColor.getrgb(c) for c in LOW_BIT_PALETTE_PRESETS["Black & White"][1]]}
         self.custom_palettes_path = get_custom_palettes_path()
         self.custom_palettes = load_custom_palettes(self.custom_palettes_path)
         self.active_palette_name = load_active_palette()
@@ -4521,7 +4668,9 @@ class RandomPixelGenerator:
         self.resolution_var = tk.StringVar(value=DEFAULT_IMAGE_RESOLUTION_LABEL)
         self.depth_var = tk.StringVar(value="1")
         self.fractal_type_var = tk.StringVar(value=DEFAULT_FRACTAL_TYPE)
-        self.bilinear_var = tk.BooleanVar(value=False)
+        self.bilinear_var = tk.BooleanVar(value=False)  # Retained internally for older render helpers.
+        self.screen_effect_var = tk.StringVar(value="None")
+        self.applied_screen_effect = "None"
         self.pixel_size_var = tk.IntVar(value=1)
         self.pixel_size_label_var = tk.StringVar(value="1×1")
         self.fps_index_var = tk.IntVar(value=1)  # 0=30, 1=60, 2=120 FPS
@@ -4596,8 +4745,7 @@ class RandomPixelGenerator:
             row=0, column=6, padx=(0, 12), sticky="w"
         )
 
-        # Action buttons, color depth and bilinear filtering share this row.
-        # Keep color depth directly before the bilinear filtering switch.
+        # Action buttons, color depth and screen-effect controls share this row.
         depth_frame = ttk.Frame(settings_frame)
         depth_frame.grid(row=1, column=0, columnspan=11, sticky="ew", pady=(5, 0))
         self.generate_button = ttk.Button(
@@ -4663,7 +4811,7 @@ class RandomPixelGenerator:
         self.gif_button.pack(side="left", padx=6)
         self.cancel_video_button.pack_forget()
 
-        # Keep color depth immediately before the bilinear filtering option.
+        # Color depth and the applied screen-effect controls share this row.
         ttk.Label(depth_frame, text="Color depth:").pack(side="left", padx=(14, 5))
         self.depth_combo = ttk.Combobox(
             depth_frame,
@@ -4676,13 +4824,21 @@ class RandomPixelGenerator:
         self.depth_combo.bind("<<ComboboxSelected>>", self._on_depth_change)
         ttk.Label(depth_frame, text="bits").pack(side="left", padx=(0, 8))
 
-        self.bilinear_check = ttk.Checkbutton(
-            depth_frame,
-            text="Bilinear filtering",
-            variable=self.bilinear_var,
-            command=self._on_bilinear_change,
+        effect_frame = ttk.Frame(settings_frame)
+        effect_frame.grid(row=2, column=0, columnspan=11, sticky="w", pady=(4, 0))
+        ttk.Label(effect_frame, text="Screen effect:").pack(side="left", padx=(0, 4))
+        self.effect_combo = ttk.Combobox(
+            effect_frame,
+            textvariable=self.screen_effect_var,
+            values=SCREEN_EFFECT_OPTIONS,
+            width=18,
+            state="readonly",
         )
-        self.bilinear_check.pack(side="left", padx=(8, 0))
+        self.effect_combo.pack(side="left", padx=(0, 5))
+        self.apply_effect_button = ttk.Button(
+            effect_frame, text="Apply Effect", command=self._on_screen_effect_apply
+        )
+        self.apply_effect_button.pack(side="left", padx=(0, 4))
 
         # Keep duration and frame-rate controls close together. Both sliders
         # use identical track thickness and thumb dimensions so their tracks
@@ -4789,9 +4945,17 @@ class RandomPixelGenerator:
         )
         self.gif_resolution_combo.grid(row=1, column=0, sticky="w")
 
-        rotation_frame = ttk.Frame(video_controls_frame)
-        rotation_frame.grid(row=1, column=0, padx=(0, 18), pady=(8, 0), sticky="nw")
-        ttk.Label(rotation_frame, text="H.265 image rotation:").grid(
+        # Place the rotation-angle slider first and the direction selector
+        # immediately to its right.  Keep both controls in a dedicated row so
+        # the wide video/GIF controls above cannot shift them unexpectedly.
+        rotation_controls_frame = ttk.Frame(video_controls_frame)
+        rotation_controls_frame.grid(
+            row=1, column=0, columnspan=2, padx=(0, 0), pady=(8, 0), sticky="nw"
+        )
+
+        rotation_frame = ttk.Frame(rotation_controls_frame)
+        rotation_frame.grid(row=0, column=0, sticky="nw")
+        ttk.Label(rotation_frame, text="Image rotation:").grid(
             row=0, column=0, sticky="w"
         )
         self.rotation_scale = tk.Scale(
@@ -4815,8 +4979,9 @@ class RandomPixelGenerator:
             row=2, column=0
         )
         ttk.Label(rotation_frame, text="720°").grid(row=2, column=0, sticky="e")
-        direction_frame = ttk.Frame(video_controls_frame)
-        direction_frame.grid(row=1, column=1, padx=(0, 0), pady=(8, 0), sticky="nw")
+
+        direction_frame = ttk.Frame(rotation_controls_frame)
+        direction_frame.grid(row=0, column=1, padx=(14, 0), sticky="nw")
         ttk.Label(direction_frame, text="Rotation direction:").grid(
             row=0, column=0, sticky="w"
         )
@@ -4826,8 +4991,10 @@ class RandomPixelGenerator:
             values=["Clockwise", "Counterclockwise"],
             width=17,
             state="readonly",
+            style="RotationDirection.TCombobox",
         )
         self.rotation_direction_combo.grid(row=1, column=0, sticky="w")
+        self._sync_rotation_direction_control_height()
 
         encoding_frame = ttk.Frame(video_controls_frame)
         encoding_frame.grid(row=2, column=0, columnspan=4, padx=(0, 0), pady=(8, 0), sticky="nw")
@@ -4923,8 +5090,12 @@ class RandomPixelGenerator:
             command=self.open_fractal_animation_studio,
         )
 
+        self.palette_menu = tk.Menu(self.root, tearoff=0)
+        self.palette_menu.add_command(label="Edit Low-Bit Palettes...", command=self.open_low_bit_palette_editor)
+        self.palette_menu.add_command(label="Reset Low-Bit Palettes to Defaults", command=self.reset_low_bit_palettes)
+        self._native_theme_menus = [self.fractal_tools_menu, self.palette_menu]
         self.themes_menu = tk.Menu(self.root, tearoff=0)
-        self._native_theme_menus = [self.fractal_tools_menu, self.themes_menu]
+        self._native_theme_menus = [self.fractal_tools_menu, self.palette_menu, self.themes_menu]
         for family_label, family_name in THEME_FAMILIES:
             family_menu = tk.Menu(self.themes_menu, tearoff=0)
             for mode in THEME_MODES:
@@ -4944,11 +5115,14 @@ class RandomPixelGenerator:
         self.themes_menu_button = ttk.Menubutton(
             self.menu_bar, text="Themes", menu=self.themes_menu
         )
+        self.palette_menu_button = ttk.Menubutton(
+            self.menu_bar, text="Palettes", menu=self.palette_menu
+        )
 
         self.about_menu = tk.Menu(self.root, tearoff=0)
         self._native_theme_menus.append(self.about_menu)
         self.about_menu.add_command(
-            label="Pixel Generator V1.1", command=self.show_about
+            label="Pixel Generator V1.5", command=self.show_about
         )
         self.about_menu_button = ttk.Menubutton(
             self.menu_bar, text="About", menu=self.about_menu
@@ -4956,6 +5130,7 @@ class RandomPixelGenerator:
         # Keep Themes directly beside About, with Fractal Tools to their left.
         self.about_menu_button.pack(side="right")
         self.themes_menu_button.pack(side="right", padx=(0, 8))
+        self.palette_menu_button.pack(side="right", padx=(0, 8))
         self.fractal_tools_menu_button.pack(side="right", padx=(0, 8))
         self.root.bind("<Control-z>", lambda _event: self.undo_fractal_navigation())
         self.root.bind("<Control-y>", lambda _event: self.redo_fractal_navigation())
@@ -4992,6 +5167,7 @@ class RandomPixelGenerator:
             "duration_scale",
             "fps_scale",
             "gif_duration_scale",
+            "rotation_scale",
         ):
             scale = getattr(self, attribute_name, None)
             if scale is not None:
@@ -5048,6 +5224,7 @@ class RandomPixelGenerator:
             self.theme_style.theme_use(theme_name)
             self.current_theme = theme_name
             self.theme_var.set(theme_name)
+            self._sync_rotation_direction_control_height()
             self._apply_classic_widget_theme()
             save_theme_preference(theme_name, self.theme_preference_path)
             return True
@@ -5080,7 +5257,7 @@ class RandomPixelGenerator:
 
         ttk.Label(
             content,
-            text="Pixel Generator V1.1",
+            text="Pixel Generator V1.5",
             font=("Segoe UI", 11, "bold"),
         ).pack(anchor="center", pady=(0, 10))
 
@@ -5372,15 +5549,58 @@ class RandomPixelGenerator:
             self._commit_fractal_view(view_state)
         return "break"
 
+    def _adjust_pixel_size_from_mousewheel(self, x, y, steps):
+        """Adjust pixel doubling when the wheel is used over a random-image preview.
+
+        The preview bounds check is intentional: scrolling over the empty canvas
+        area must not change the pixel size. Fractal mode keeps its existing
+        cursor-centered zoom behavior in the mouse-wheel handlers below.
+        """
+        if self.current_image_type != "random":
+            return None
+        if self._preview_coordinates(x, y) is None:
+            return "break"
+        if (
+            getattr(self, "is_generating", False)
+            or getattr(self, "is_exporting_video", False)
+            or getattr(self, "is_exporting_gif", False)
+            or getattr(self, "is_batch_generating", False)
+            or getattr(self, "is_exporting_animation", False)
+        ):
+            return "break"
+
+        current_size = int(self.pixel_size_var.get())
+        new_size = max(1, min(32, current_size + int(steps)))
+        if new_size != current_size:
+            self.pixel_size_var.set(new_size)
+            # Reuse the same live-preview refresh path as the existing slider.
+            self._on_pixel_size_change()
+        return "break"
+
     def _on_fractal_mousewheel(self, event):
         delta = int(getattr(event, "delta", 0))
         if delta == 0:
             return "break"
+
+        # In Render Pixel mode, the wheel changes pixel doubling instead of
+        # fractal zoom. One wheel notch changes the size by one step; high-
+        # resolution wheels may report multiple 120-unit notches at once.
+        if self.current_image_type == "random":
+            wheel_steps = max(1, int(round(abs(delta) / 120.0)))
+            return self._adjust_pixel_size_from_mousewheel(
+                event.x, event.y, wheel_steps if delta > 0 else -wheel_steps
+            )
+
         steps = max(0.25, min(4.0, abs(delta) / 120.0))
         zoom_factor = 1.25 ** steps if delta > 0 else 1.0 / (1.25 ** steps)
         return self._zoom_fractal_at(event.x, event.y, zoom_factor)
 
     def _on_fractal_mousewheel_linux(self, event):
+        if self.current_image_type == "random":
+            wheel_steps = 1 if int(getattr(event, "num", 0)) == 4 else -1
+            return self._adjust_pixel_size_from_mousewheel(
+                event.x, event.y, wheel_steps
+            )
         zoom_factor = 1.25 if int(getattr(event, "num", 0)) == 4 else 1.0 / 1.25
         return self._zoom_fractal_at(event.x, event.y, zoom_factor)
 
@@ -5436,18 +5656,27 @@ class RandomPixelGenerator:
         self.pixel_size_label_var.set(f"{pixel_size}×{pixel_size}")
         self._refresh_image_preview()
 
-    def _on_bilinear_change(self):
-        """Toggle bilinear rendering and refresh the preview immediately."""
-        self._refresh_image_preview()
+    def _on_screen_effect_apply(self):
+        """Apply the chosen effect to the preview and all subsequent exports."""
+        selected = str(self.screen_effect_var.get() or "None")
+        if selected not in SCREEN_EFFECT_OPTIONS:
+            messagebox.showerror("Screen effect", "Choose a supported screen effect.")
+            return
+        self.applied_screen_effect = selected
+        if self.base_image is not None:
+            self._refresh_image_preview()
+        else:
+            self.status_var.set(f"Screen effect selected: {selected}. Generate an image to preview it.")
 
     def _refresh_image_preview(self):
         if self.base_image is not None and not self.is_generating:
             try:
-                self.image = pixelate_image(
+                pixelated = pixelate_image(
                     self.base_image,
                     int(self.pixel_size_var.get()),
                     bilinear=bool(self.bilinear_var.get()),
                 )
+                self.image = apply_screen_effect(pixelated, self.applied_screen_effect)
                 self.show_preview()
                 self._update_image_status()
                 self.save_button.configure(state="normal")
@@ -5459,7 +5688,7 @@ class RandomPixelGenerator:
             return
         width, height = self.base_image.size
         pixel_size = int(self.pixel_size_var.get())
-        render_mode = "Bilinear filtering" if self.bilinear_var.get() else "Sharp pixel blocks"
+        render_mode = f"Effect: {self.applied_screen_effect}"
         source_label = (
             f"{self.current_fractal_type} fractal"
             if self.current_image_type == "fractal"
@@ -5498,6 +5727,32 @@ class RandomPixelGenerator:
         if value is not None:
             self.fps_index_var.set(max(0, min(2, int(float(value)))))
         self.fps_label_var.set(f"{self._get_selected_fps()} FPS")
+
+    def _sync_rotation_direction_control_height(self):
+        """Match the direction combobox height to the adjacent rotation slider."""
+        combo = getattr(self, "rotation_direction_combo", None)
+        scale = getattr(self, "rotation_scale", None)
+        if combo is None or scale is None:
+            return
+
+        # A compact style keeps the read-only selector visually balanced with
+        # the classic Tk scale.  The slider thickness is then adjusted by the
+        # exact measured difference, which works across themes and DPI scales.
+        try:
+            configure_style = getattr(self.theme_style, "configure", None)
+            if callable(configure_style):
+                configure_style("RotationDirection.TCombobox", padding=(6, 1, 6, 1))
+            self.root.update_idletasks()
+            combo_height = int(combo.winfo_reqheight())
+            scale_height = int(scale.winfo_reqheight())
+            if combo_height != scale_height:
+                current_width = int(scale.cget("width"))
+                scale.configure(width=max(1, current_width + combo_height - scale_height))
+                self.root.update_idletasks()
+        except (tk.TclError, TypeError, ValueError):
+            # A theme engine may not expose custom style configuration; retain
+            # the standard widget appearance rather than blocking app startup.
+            pass
 
     def _on_rotation_change(self, value=None):
         if value is not None:
@@ -5653,7 +5908,7 @@ class RandomPixelGenerator:
             self.status_var.set(
                 f"Generating random image: {width} × {height}, {depth}-bit, "
                 f"{pixel_size}×{pixel_size} pixel blocks, "
-                f"{'bilinear filtering' if bilinear else 'sharp pixel blocks'}..."
+                f"screen effect: {self.applied_screen_effect}..."
             )
         self.resize_window_to_image(width, height)
 
@@ -5664,7 +5919,7 @@ class RandomPixelGenerator:
         )
         threading.Thread(
             target=self._image_worker,
-            args=(width, height, depth, image_type, fractal_type, rendering_mode, fractal_view_state, custom_palette_stops, self.active_palette_name),
+            args=(width, height, depth, image_type, fractal_type, rendering_mode, fractal_view_state, custom_palette_stops, self.active_palette_name, palette_for_depth(self.low_bit_palettes, depth)),
             daemon=True,
         ).start()
 
@@ -5675,6 +5930,7 @@ class RandomPixelGenerator:
         fractal_view_state=None,
         custom_palette_stops=None,
         custom_palette_name="Random",
+        low_bit_palette=None,
     ):
         try:
             render_info = None
@@ -5732,6 +5988,7 @@ class RandomPixelGenerator:
                         rng=(np.random.default_rng(fractal_seed) if fractal_seed is not None else None),
                         return_view_state=True,
                         custom_palette=custom_palette_stops,
+                        custom_index_palette=low_bit_palette if depth <= 4 else None,
                     )
                     resulting_view_state["palette_name"] = (
                         custom_palette_name if custom_palette_stops else
@@ -5748,6 +6005,7 @@ class RandomPixelGenerator:
                         compute_backend="CPU", view_state=fractal_view_state,
                         rng=(np.random.default_rng(fractal_seed) if fractal_seed is not None else None),
                         return_view_state=True, custom_palette=custom_palette_stops,
+                        custom_index_palette=low_bit_palette if depth <= 4 else None,
                     )
                     resulting_view_state["palette_name"] = (
                         custom_palette_name if custom_palette_stops else
@@ -5765,7 +6023,7 @@ class RandomPixelGenerator:
                 render_info["render_seconds"] = render_seconds
                 render_info["backend_setup_seconds"] = backend_setup_seconds
             else:
-                image, color_count = generate_random_image(width, height, depth)
+                image, color_count = generate_random_image(width, height, depth, custom_palette=low_bit_palette if depth <= 4 else None)
 
             self.result_queue.put(
                 (
@@ -5889,7 +6147,8 @@ class RandomPixelGenerator:
         default_name = (
             f"{source_label}_{width}x{height}_{duration_seconds}s_{fps}fps_"
             f"{normalize_video_codec(video_codec)}_{rate_label}_"
-            f"rotate_{rotation_degrees}_{rotation_direction.lower()}.mp4"
+            f"rotate_{rotation_degrees}_{rotation_direction.lower()}_"
+            f"{self.applied_screen_effect.lower().replace(' ', '-')}.mp4"
         )
         output_path = filedialog.asksaveasfilename(
             title=f"Export {video_codec} video",
@@ -5932,7 +6191,8 @@ class RandomPixelGenerator:
         self.status_var.set(
             f"Exporting {source_description} as {video_codec}: {width} × {height}, "
             f"{duration_seconds} seconds, {fps} fps, {rate_description}, "
-            f"rotating {rotation_degrees}° {rotation_direction.lower()}..."
+            f"rotating {rotation_degrees}° {rotation_direction.lower()}, "
+            f"effect: {self.applied_screen_effect}..."
         )
 
         threading.Thread(
@@ -5942,7 +6202,7 @@ class RandomPixelGenerator:
                 duration_seconds, fps, bitrate_kbps, rotation_degrees,
                 rotation_direction, export_depth, export_pixel_size,
                 export_bilinear, self.rendering_mode_var.get(), video_codec,
-                video_cancel_control,
+                video_cancel_control, self.applied_screen_effect,
             ),
             daemon=True,
         ).start()
@@ -5970,6 +6230,7 @@ class RandomPixelGenerator:
             messagebox.showerror("Invalid GIF settings", str(exc))
             return
         bilinear = bool(self.bilinear_var.get())
+        screen_effect = self.applied_screen_effect
 
         gif_width, gif_height = gif_resolution
         total_frames = duration_seconds * GIF_FPS
@@ -5977,7 +6238,7 @@ class RandomPixelGenerator:
         default_name = (
             f"random_pixels_{gif_width}x{gif_height}_{duration_seconds}s_"
             f"{GIF_FPS}fps_{depth}bit_{pixel_size}x{pixel_size}px_"
-            f"{'bilinear' if bilinear else 'nearest'}.gif"
+            f"{screen_effect.lower().replace(' ', '-')}.gif"
         )
         output_path = filedialog.asksaveasfilename(
             title="Export animated GIF",
@@ -5999,21 +6260,23 @@ class RandomPixelGenerator:
             f"Exporting GIF: {gif_width} × {gif_height}, "
             f"{duration_seconds} seconds, {GIF_FPS} FPS ({total_frames} frames), "
             f"{depth}-bit source, {pixel_size}×{pixel_size} pixel blocks, "
-            f"{'bilinear filtering' if bilinear else 'sharp pixel blocks'}..."
+            f"screen effect: {screen_effect}..."
         )
 
         threading.Thread(
             target=self._gif_worker,
             args=(
                 output_path, depth, pixel_size, bilinear,
-                duration_seconds, gif_resolution,
+                duration_seconds, gif_resolution, palette_for_depth(self.low_bit_palettes, depth),
+                screen_effect,
             ),
             daemon=True,
         ).start()
 
     def _gif_worker(
         self, output_path, depth, pixel_size, bilinear,
-        duration_seconds, gif_resolution,
+        duration_seconds, gif_resolution, custom_palette=None,
+        screen_effect="None",
     ):
         try:
             def report_progress(frame_number):
@@ -6027,6 +6290,8 @@ class RandomPixelGenerator:
                 bilinear=bilinear,
                 progress_callback=report_progress,
                 resolution=gif_resolution,
+                custom_palette=custom_palette if depth <= 4 else None,
+                screen_effect=screen_effect,
             )
             self.gif_queue.put(("success", output_path))
         except Exception as exc:
@@ -6095,6 +6360,8 @@ class RandomPixelGenerator:
         rendering_mode="Automatic",
         video_codec=VIDEO_DEFAULT_CODEC,
         cancel_control=None,
+        screen_effect="None",
+        custom_palette=None,
     ):
         try:
             if cancel_control is not None:
@@ -6121,6 +6388,8 @@ class RandomPixelGenerator:
                     compute_backend=rendering_mode,
                     video_codec=video_codec,
                     cancel_control=cancel_control,
+                    custom_palette=custom_palette if export_depth <= 4 else None,
+                    screen_effect=screen_effect,
                 )
             else:
                 video_info = encode_rotating_image_h264_video(
@@ -6270,6 +6539,7 @@ class RandomPixelGenerator:
             "depth": int(self.current_depth or int(self.depth_var.get())),
             "pixel_size": int(self.pixel_size_var.get()),
             "bilinear": bool(self.bilinear_var.get()),
+            "screen_effect": self.applied_screen_effect,
         }
         self.bookmarks.append(record)
         try:
@@ -6302,6 +6572,10 @@ class RandomPixelGenerator:
             self.pixel_size_var.set(pixel_size)
             self._on_pixel_size_change()
         self.bilinear_var.set(bool(record.get("bilinear", self.bilinear_var.get())))
+        saved_effect = str(record.get("screen_effect", self.applied_screen_effect))
+        if saved_effect in SCREEN_EFFECT_OPTIONS:
+            self.applied_screen_effect = saved_effect
+            self.screen_effect_var.set(saved_effect)
         state["fractal_type"] = fractal_type
         self.current_fractal_type = fractal_type
         self.fractal_type_var.set(fractal_type)
@@ -6381,6 +6655,7 @@ class RandomPixelGenerator:
             "depth": int(self.current_depth or 24),
             "pixel_size": int(self.pixel_size_var.get()),
             "bilinear": bool(self.bilinear_var.get()),
+            "screen_effect": self.applied_screen_effect,
             "palette_name": self.active_palette_name,
             "render_backend": self.current_render_backend,
             "render_seconds": self.current_render_seconds,
@@ -6454,6 +6729,102 @@ class RandomPixelGenerator:
         ttk.Button(window, text="Close", command=window.destroy).grid(row=1, column=3, sticky="e", padx=10, pady=(0, 10))
         listbox.bind("<Double-Button-1>", lambda _event: load_selected())
         refresh()
+
+    def reset_low_bit_palettes(self):
+        self.low_bit_palettes = {1: {"name": "Black & White", "colors": [ImageColor.getrgb(c) for c in LOW_BIT_PALETTE_PRESETS["Black & White"][1]]}}
+        save_low_bit_palettes(self.low_bit_palettes, self.low_bit_palettes_path)
+        self.status_var.set("Low-bit palettes reset to defaults.")
+        self.generate_image()
+
+    def _refresh_after_low_bit_palette_apply(self):
+        """Refresh the active image while preserving the current generator mode."""
+        if self.current_image_type == "fractal":
+            view_state = self.current_fractal_view_state
+            if isinstance(view_state, dict):
+                self._render_fractal_view(view_state)
+            else:
+                self.generate_fractal()
+        else:
+            self.generate_image()
+
+    def open_low_bit_palette_editor(self):
+        window = tk.Toplevel(self.root)
+        window.title("Custom Low-Bit Color Palettes")
+        window.transient(self.root)
+        window.geometry("560x430")
+        window.resizable(False, False)
+        depth_var = tk.StringVar(value=self.depth_var.get() if self.depth_var.get() in ("1", "2", "4") else "1")
+        preset_var = tk.StringVar(value="Custom")
+        name_var = tk.StringVar(value="My Palette")
+        colors = []
+        swatch_buttons = []
+        ttk.Label(window, text="Color depth:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        depth_combo = ttk.Combobox(window, textvariable=depth_var, values=("1", "2", "4"), state="readonly", width=6)
+        depth_combo.grid(row=0, column=1, sticky="w")
+        ttk.Label(window, text="Preset:").grid(row=0, column=2, padx=(12, 4), sticky="w")
+        preset_combo = ttk.Combobox(window, textvariable=preset_var, values=tuple(LOW_BIT_PALETTE_PRESETS)+("Custom",), state="readonly", width=20)
+        preset_combo.grid(row=0, column=3, sticky="w", padx=(0, 10))
+        palette_frame = ttk.Frame(window, padding=10)
+        palette_frame.grid(row=1, column=0, columnspan=4, sticky="nsew")
+        ttk.Label(window, text="Click a color swatch to edit it. Colors are applied automatically to random images, fractals, GIFs and random video exports for 1/2/4-bit modes.", wraplength=530).grid(row=2, column=0, columnspan=4, padx=10, pady=5, sticky="w")
+        ttk.Label(window, text="Save palette name:").grid(row=3, column=0, padx=10, sticky="w")
+        name_entry = ttk.Entry(window, textvariable=name_var, width=24)
+        name_entry.grid(row=3, column=1, sticky="w")
+        status_var = tk.StringVar(value="")
+        ttk.Label(window, textvariable=status_var).grid(row=4, column=0, columnspan=4, padx=10, sticky="w")
+
+        def current_depth(): return int(depth_var.get())
+        def repaint():
+            for w in palette_frame.winfo_children(): w.destroy()
+            swatch_buttons.clear()
+            for i, color in enumerate(colors):
+                btn = tk.Button(palette_frame, text=f"{i}: #{color[0]:02X}{color[1]:02X}{color[2]:02X}", bg="#%02X%02X%02X" % tuple(color), fg=("white" if sum(color)<380 else "black"), width=17, height=2, command=lambda idx=i: edit_color(idx))
+                btn.grid(row=i//4, column=i%4, padx=4, pady=4)
+                swatch_buttons.append(btn)
+        def edit_color(index):
+            old = "#%02X%02X%02X" % tuple(colors[index])
+            _rgb, picked = colorchooser.askcolor(color=old, parent=window, title=f"Edit palette color {index}")
+            if picked:
+                colors[index] = ImageColor.getrgb(picked)
+                preset_var.set("Custom")
+                repaint()
+        def load_palette():
+            d = current_depth()
+            selected = preset_var.get()
+            entry = self.low_bit_palettes.get(d, {})
+            saved = entry.get("saved", {})
+            preset_combo.configure(values=tuple(LOW_BIT_PALETTE_PRESETS)+("Custom",)+tuple(sorted(saved, key=str.casefold)))
+            if selected in LOW_BIT_PALETTE_PRESETS:
+                colors[:] = [ImageColor.getrgb(c) for c in LOW_BIT_PALETTE_PRESETS[selected][d]]
+                name_var.set(selected)
+            elif selected in saved:
+                colors[:] = list(saved[selected])
+                name_var.set(selected)
+            else:
+                colors[:] = list(entry.get("colors", [])) if len(entry.get("colors", [])) == (1 << d) else [ImageColor.getrgb(c) for c in LOW_BIT_PALETTE_PRESETS["Black & White"][d]]
+                name_var.set(entry.get("name", "Custom") if entry else "Custom")
+            repaint()
+        def save_apply():
+            d = current_depth()
+            if len(colors) != 1 << d:
+                messagebox.showerror("Palette error", f"{d}-bit palettes require exactly {1 << d} colors.", parent=window)
+                return
+            palette_name = name_var.get().strip() or "Custom"
+            previous = self.low_bit_palettes.get(d, {})
+            saved = dict(previous.get("saved", {}))
+            saved[palette_name] = list(colors)
+            self.low_bit_palettes[d] = {"name": palette_name, "colors": list(colors), "saved": saved}
+            save_low_bit_palettes(self.low_bit_palettes, self.low_bit_palettes_path)
+            status_var.set(f"Saved and applied {d}-bit palette: {self.low_bit_palettes[d]['name']}")
+            if self.depth_var.get() == str(d):
+                # Applying a palette must refresh the currently active workspace,
+                # not force the user back into the Random Pixel Generator view.
+                self._refresh_after_low_bit_palette_apply()
+        preset_combo.bind("<<ComboboxSelected>>", lambda _e: load_palette())
+        depth_combo.bind("<<ComboboxSelected>>", lambda _e: load_palette())
+        ttk.Button(window, text="Apply & Save", command=save_apply).grid(row=5, column=0, padx=10, pady=10, sticky="w")
+        ttk.Button(window, text="Close", command=window.destroy).grid(row=5, column=3, padx=10, pady=10, sticky="e")
+        load_palette()
 
     def open_palette_editor(self):
         window = tk.Toplevel(self.root)
@@ -6698,11 +7069,12 @@ class RandomPixelGenerator:
             args=(count, family, folder, width, height, depth, pixel_size,
                   bool(self.bilinear_var.get()), self.rendering_mode_var.get(),
                   list(self.active_palette_stops) if self.active_palette_stops else None,
-                  self.active_palette_name, bool(self.gallery_auto_save_var.get())),
+                  self.active_palette_name, bool(self.gallery_auto_save_var.get()),
+                  palette_for_depth(self.low_bit_palettes, depth)),
             daemon=True,
         ).start()
 
-    def _batch_generation_worker(self, count, family, folder, width, height, depth, pixel_size, bilinear, rendering_mode, palette_stops, palette_name, auto_save_gallery):
+    def _batch_generation_worker(self, count, family, folder, width, height, depth, pixel_size, bilinear, rendering_mode, palette_stops, palette_name, auto_save_gallery, low_bit_palette=None):
         completed = 0
         rng = np.random.default_rng()
         families = list(FRACTAL_TYPE_OPTIONS)
@@ -6717,6 +7089,7 @@ class RandomPixelGenerator:
                     width, height, depth, fractal_type=fractal_type,
                     compute_backend=backend, opencl_renderer=renderer, rng=rng,
                     return_view_state=True, custom_palette=palette_stops,
+                    custom_index_palette=low_bit_palette if depth <= 4 else None,
                 )
                 view_state["palette_name"] = palette_name
                 final_image = pixelate_image(image, pixel_size, bilinear=bilinear)
@@ -6887,6 +7260,8 @@ class RandomPixelGenerator:
                 if not output_path:
                     return
                 state = dict(self.current_fractal_view_state)
+                _selected_palette = palette_for_depth(self.low_bit_palettes, depth)
+                state["custom_index_palette"] = _selected_palette.tolist() if depth <= 4 and _selected_palette is not None else None
                 fractal_type = self.current_fractal_type
                 bilinear = bool(self.bilinear_var.get())
                 rendering_mode = self.rendering_mode_var.get()
@@ -6896,6 +7271,7 @@ class RandomPixelGenerator:
                     fractal_type, state, duration, fps, zoom, x_ratio, y_ratio,
                     rendering_mode, rotation_degrees, rotation_direction,
                     animation_codec, animation_bitrate_kbps,
+                    self.applied_screen_effect,
                 )
             except Exception as exc:
                 messagebox.showerror("Animation settings", str(exc), parent=window)
@@ -6927,6 +7303,8 @@ class RandomPixelGenerator:
                     return
                 _width, _height, depth, pixel_size = settings
                 state = dict(self.current_fractal_view_state)
+                _selected_palette = palette_for_depth(self.low_bit_palettes, depth)
+                state["custom_index_palette"] = _selected_palette.tolist() if depth <= 4 and _selected_palette is not None else None
                 fractal_type = self.current_fractal_type
                 bilinear = bool(self.bilinear_var.get())
                 rendering_mode = self.rendering_mode_var.get()
@@ -6950,6 +7328,7 @@ class RandomPixelGenerator:
                     bilinear, fractal_type, state, duration, zoom,
                     x_ratio, y_ratio, rendering_mode,
                     rotation_degrees, rotation_direction,
+                    self.applied_screen_effect,
                 )
             except Exception as exc:
                 messagebox.showerror("GIF animation settings", str(exc), parent=window)
@@ -6964,6 +7343,7 @@ class RandomPixelGenerator:
         self, output_path, width, height, depth, pixel_size, bilinear,
         fractal_type, view_state, duration, zoom, target_x, target_y,
         rendering_mode, rotation_degrees=0, rotation_direction="Clockwise",
+        screen_effect="None",
     ):
         self.is_exporting_animation = True
         animation_cancel_control = VideoExportControl()
@@ -6986,7 +7366,7 @@ class RandomPixelGenerator:
                 output_path, width, height, depth, pixel_size, bilinear,
                 fractal_type, view_state, duration, zoom, target_x, target_y,
                 rendering_mode, rotation_degrees, rotation_direction,
-                animation_cancel_control,
+                animation_cancel_control, screen_effect,
             ),
             daemon=True,
         ).start()
@@ -6995,7 +7375,7 @@ class RandomPixelGenerator:
         self, output_path, width, height, depth, pixel_size, bilinear,
         fractal_type, view_state, duration, zoom, target_x, target_y,
         rendering_mode, rotation_degrees=0, rotation_direction="Clockwise",
-        cancel_control=None,
+        cancel_control=None, screen_effect="None",
     ):
         try:
             if cancel_control is not None:
@@ -7019,6 +7399,7 @@ class RandomPixelGenerator:
                 rotation_direction=rotation_direction,
                 resolution=(width, height),
                 cancel_control=cancel_control,
+                screen_effect=screen_effect,
             )
             if cancel_control is not None:
                 cancel_control.check()
@@ -7034,7 +7415,7 @@ class RandomPixelGenerator:
                 _remove_incomplete_video_file(output_path)
                 self.animation_queue.put(("gif_error", str(exc)))
 
-    def _start_fractal_animation_export(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS):
+    def _start_fractal_animation_export(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS, screen_effect="None"):
         self.is_exporting_animation = True
         animation_cancel_control = VideoExportControl()
         self.active_video_export_control = animation_cancel_control
@@ -7050,11 +7431,11 @@ class RandomPixelGenerator:
         self.status_var.set(f"Preparing {fractal_type} zoom animation: {width}×{height}, {duration}s at {fps} FPS...")
         threading.Thread(
             target=self._animation_worker,
-            args=(output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees, rotation_direction, video_codec, bitrate_kbps, animation_cancel_control),
+            args=(output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees, rotation_direction, video_codec, bitrate_kbps, animation_cancel_control, screen_effect),
             daemon=True,
         ).start()
 
-    def _animation_worker(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS, cancel_control=None):
+    def _animation_worker(self, output_path, width, height, depth, pixel_size, bilinear, fractal_type, view_state, duration, fps, zoom, target_x, target_y, rendering_mode, rotation_degrees=0, rotation_direction="Clockwise", video_codec=VIDEO_DEFAULT_CODEC, bitrate_kbps=VIDEO_DEFAULT_BITRATE_KBPS, cancel_control=None, screen_effect="None"):
         try:
             if cancel_control is not None:
                 cancel_control.check()
@@ -7071,6 +7452,7 @@ class RandomPixelGenerator:
                 video_codec=video_codec,
                 bitrate_kbps=bitrate_kbps,
                 cancel_control=cancel_control,
+                screen_effect=screen_effect,
             )
             if cancel_control is not None:
                 cancel_control.check()
@@ -7244,7 +7626,8 @@ class RandomPixelGenerator:
         self.resolution_combo.configure(state="disabled" if busy else "readonly")
         self.pixel_size_scale.configure(state="disabled" if busy else "normal")
         self.depth_combo.configure(state="disabled" if busy else "readonly")
-        self.bilinear_check.configure(state="disabled" if busy else "normal")
+        self.effect_combo.configure(state="disabled" if busy else "readonly")
+        self.apply_effect_button.configure(state="disabled" if busy else "normal")
         if hasattr(self, "fractal_tools_menu_button"):
             self.fractal_tools_menu_button.configure(state="disabled" if busy else "normal")
         self.save_button.configure(
